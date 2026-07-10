@@ -1,0 +1,21 @@
+# ── Telegram ──────────────────────────────────────────────────────────
+telethon>=1.36.0              # Listener: baca sinyal dari akun user (user session)
+python-telegram-bot>=21.0     # Control bot: terima command, kirim notifikasi
+
+# ── Exchange ───────────────────────────────────────────────────────────
+# ccxt>=4.x sudah include ccxt.pro (WebSocket) — tidak perlu extra [pro]
+ccxt>=4.3.0                   # REST API + WebSocket (watch_orders, watch_positions)
+
+# ── Database ───────────────────────────────────────────────────────────
+sqlmodel>=0.0.21              # ORM ringan di atas SQLAlchemy + Pydantic
+aiosqlite>=0.20.0             # Async SQLite driver
+
+# ── Config & Env ───────────────────────────────────────────────────────
+python-dotenv>=1.0.0          # Load .env ke environment variables
+
+# ── HTTP & Async ───────────────────────────────────────────────────────
+aiohttp>=3.9.0                # Async HTTP (dipakai ccxt & internal)
+
+# ── Utilities ──────────────────────────────────────────────────────────
+pytz>=2024.1                  # Timezone handling (UTC ↔ Asia/Jakarta)
+python-dateutil>=2.9.0        # Parsing tanggal fleksibel

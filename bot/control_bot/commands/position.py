@@ -1,0 +1,513 @@
+"""
+bot/control_bot/commands/position.py
+======================================
+Step 17 — handler command manajemen posisi.
+Step 18 — migrated ke TTL-based pending_store (timeout + on_timeout callback).
+
+Perubahan step 18:
+- _PENDING dict diganti dengan pending_store (TTL-aware, asyncio-based)
+- Setiap konfirmasi dapat on_timeout → edit pesan lama jadi notif "kedaluwarsa"
+- _store_pending / _pop_pending dihapus, diganti pending_store.add / .pop
+"""
+
+from __future__ import annotations
+
+from typing import Optional
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ParseMode
+from telegram.ext import ContextTypes
+
+from bot.control_bot.auth import authorized
+from bot.control_bot.inline.pending_store import make_pending_key, pending_store
+from bot.executor.order_manager import (
+    cancel_pending_order,
+    close_all_positions,
+    close_position,
+    set_stop_loss,
+)
+from core.constants import CloseReason
+from core.logging_setup import get_logger
+from config.settings import settings
+from db.crud.settings import is_bot_paused, set_bot_paused
+from db.crud.trades import (
+    async_get_open_trade_for_pair,
+    async_get_open_trades,
+    async_get_pending_trade_for_pair,
+    async_get_pending_trades,
+    async_update_trade_entry,
+    async_update_trade_tp,
+)
+
+logger = get_logger(__name__)
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+async def _send(update: Update, text: str, reply_markup=None):
+    return await update.message.reply_text(
+        text, parse_mode=ParseMode.HTML, reply_markup=reply_markup
+    )
+
+
+def _confirm_kb(key: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Konfirmasi", callback_data=f"pos:{key}:y"),
+        InlineKeyboardButton("❌ Batal",      callback_data=f"pos:{key}:n"),
+    ]])
+
+
+async def _send_confirm_with_ttl(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    action: str,
+    **payload_kwargs,
+) -> str:
+    """
+    Kirim pesan konfirmasi, simpan ke pending_store dengan TTL.
+    Timeout → edit pesan jadi notif kedaluwarsa.
+    Kembalikan key.
+    """
+    key = make_pending_key()
+    timeout_sec = settings.CONFIRMATION_TIMEOUT_MINUTES * 60
+    chat_id = update.effective_chat.id
+
+    sent = await _send(update, text, reply_markup=_confirm_kb(key))
+    tg_msg_id = sent.message_id
+
+    async def on_timeout(k: str, _p: dict) -> None:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=tg_msg_id,
+                text="⏰ <b>Konfirmasi kedaluwarsa</b> — aksi dibatalkan otomatis.",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as exc:
+            logger.warning("[position] timeout edit error key=%s: %s", k, exc)
+
+    pending_store.add(
+        key,
+        payload={"action": action, "tg_msg_id": tg_msg_id, **payload_kwargs},
+        timeout_seconds=timeout_sec,
+        on_timeout=on_timeout,
+    )
+    return key
+
+
+# ── /settp {pair} {harga} ─────────────────────────────────────────────────────
+
+@authorized
+async def cmd_settp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if len(context.args or []) < 2:
+        await _send(update,
+            "❌ Format: <code>/settp {pair} {harga}</code>\n"
+            "Contoh: <code>/settp BTC/USDT:USDT 70000</code>")
+        return
+
+    pair = context.args[0].upper()
+    try:
+        price = float(context.args[1])
+    except ValueError:
+        await _send(update, "❌ Harga harus angka.")
+        return
+    if price <= 0:
+        await _send(update, "❌ Harga harus lebih dari 0.")
+        return
+
+    trade = await async_get_open_trade_for_pair(pair)
+    if not trade:
+        await _send(update, f"❌ Tidak ada posisi <b>OPEN</b> untuk <code>{pair}</code>.")
+        return
+
+    direction = (trade.get("direction") or "?").upper()
+    entry     = trade.get("entry_price")
+    entry_str = f"{entry:g}" if entry else "?"
+    await _send_confirm_with_ttl(
+        update, context,
+        f"⚠️ <b>Set Take Profit</b>\n\n"
+        f"Pair     : <code>{pair}</code> {direction}\n"
+        f"Entry    : <code>{entry_str}</code>\n"
+        f"TP baru  : <code>{price:g}</code>\n"
+        f"Trade    : #{trade['id']}\n\n"
+        f"<i>TP dicatat di database — tidak membuat order di exchange.\n"
+        f"Posisi ditutup manual saat harga mencapai TP.</i>",
+        action="settp",
+        pair=pair, trade_id=trade["id"], price=price,
+    )
+
+
+# ── /setsl {pair} {harga} ─────────────────────────────────────────────────────
+
+@authorized
+async def cmd_setsl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if len(context.args or []) < 2:
+        await _send(update,
+            "❌ Format: <code>/setsl {pair} {harga}</code>\n"
+            "Contoh: <code>/setsl BTC/USDT:USDT 65000</code>")
+        return
+
+    pair = context.args[0].upper()
+    try:
+        price = float(context.args[1])
+    except ValueError:
+        await _send(update, "❌ Harga harus angka.")
+        return
+    if price <= 0:
+        await _send(update, "❌ Harga harus lebih dari 0.")
+        return
+
+    trade = await async_get_open_trade_for_pair(pair)
+    if not trade:
+        await _send(update, f"❌ Tidak ada posisi <b>OPEN</b> untuk <code>{pair}</code>.")
+        return
+
+    old_sl  = trade.get("sl_price")
+    old_str = f"{old_sl:g}" if old_sl else "tidak ada"
+    direction = (trade.get("direction") or "?").upper()
+    await _send_confirm_with_ttl(
+        update, context,
+        f"⚠️ <b>Update Stop Loss</b>\n\n"
+        f"Pair    : <code>{pair}</code> {direction}\n"
+        f"SL lama : <code>{old_str}</code>\n"
+        f"SL baru : <code>{price:g}</code>\n"
+        f"Trade   : #{trade['id']}\n\n"
+        f"<i>SL order lama akan di-cancel dan SL baru dipasang di exchange.</i>",
+        action="setsl",
+        pair=pair, trade_id=trade["id"], price=price,
+    )
+
+
+# ── /setentry {pair} {harga} ──────────────────────────────────────────────────
+
+@authorized
+async def cmd_setentry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if len(context.args or []) < 2:
+        await _send(update,
+            "❌ Format: <code>/setentry {pair} {harga}</code>\n"
+            "Contoh: <code>/setentry BTC/USDT:USDT 68000</code>")
+        return
+
+    pair = context.args[0].upper()
+    try:
+        price = float(context.args[1])
+    except ValueError:
+        await _send(update, "❌ Harga harus angka.")
+        return
+    if price <= 0:
+        await _send(update, "❌ Harga harus lebih dari 0.")
+        return
+
+    trade = await async_get_pending_trade_for_pair(pair)
+    if not trade:
+        await _send(update, f"❌ Tidak ada order <b>PENDING</b> untuk <code>{pair}</code>.")
+        return
+
+    old_entry = trade.get("entry_price")
+    old_str   = f"{old_entry:g}" if old_entry else "?"
+    direction = (trade.get("direction") or "?").upper()
+    await _send_confirm_with_ttl(
+        update, context,
+        f"⚠️ <b>Update Entry Price</b>\n\n"
+        f"Pair       : <code>{pair}</code> {direction}\n"
+        f"Entry lama : <code>{old_str}</code>\n"
+        f"Entry baru : <code>{price:g}</code>\n"
+        f"Trade      : #{trade['id']}\n\n"
+        f"<i>Update di database saja. Limit order aktif di exchange\n"
+        f"tidak berubah — gunakan <code>/cancel {pair}</code> jika perlu buka ulang.</i>",
+        action="setentry",
+        pair=pair, trade_id=trade["id"], price=price,
+    )
+
+
+# ── /close {pair} ─────────────────────────────────────────────────────────────
+
+@authorized
+async def cmd_close(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await _send(update,
+            "❌ Format: <code>/close {pair}</code>\n"
+            "Contoh: <code>/close BTC/USDT:USDT</code>")
+        return
+
+    pair  = context.args[0].upper()
+    trade = await async_get_open_trade_for_pair(pair)
+    if not trade:
+        await _send(update, f"❌ Tidak ada posisi <b>OPEN</b> untuk <code>{pair}</code>.")
+        return
+
+    direction = (trade.get("direction") or "?").upper()
+    entry_str = f"{trade['entry_price']:g}" if trade.get("entry_price") else "?"
+    size_str  = f"{trade['position_size']:g}" if trade.get("position_size") else "?"
+    sl_str    = f"{trade['sl_price']:g}" if trade.get("sl_price") else "tidak ada"
+    await _send_confirm_with_ttl(
+        update, context,
+        f"⚠️ <b>Close Posisi</b>\n\n"
+        f"Pair    : <code>{pair}</code>\n"
+        f"Arah    : <b>{direction}</b>\n"
+        f"Entry   : <code>{entry_str}</code>\n"
+        f"Size    : <code>{size_str}</code>\n"
+        f"SL      : <code>{sl_str}</code>\n"
+        f"Trade   : #{trade['id']}\n\n"
+        f"<i>Posisi akan di-close by market order. Tidak bisa di-undo.</i>",
+        action="close",
+        pair=pair, trade_id=trade["id"],
+    )
+
+
+# ── /closeall ─────────────────────────────────────────────────────────────────
+
+@authorized
+async def cmd_closeall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    open_trades = await async_get_open_trades()
+    if not open_trades:
+        await _send(update, "ℹ️ Tidak ada posisi open saat ini.")
+        return
+
+    pairs_str = "\n".join(
+        f"  • <code>{t['pair']}</code> {(t.get('direction') or '').upper()}"
+        for t in open_trades
+    )
+    await _send_confirm_with_ttl(
+        update, context,
+        f"🚨 <b>Close Semua Posisi</b>\n\n"
+        f"Posisi yang akan di-close ({len(open_trades)}):\n{pairs_str}\n\n"
+        f"<i>Semua posisi di-close by market order. Tidak bisa di-undo.</i>",
+        action="closeall",
+    )
+
+
+# ── /pending ──────────────────────────────────────────────────────────────────
+
+@authorized
+async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    pending = await async_get_pending_trades()
+    if not pending:
+        await _send(update, "ℹ️ Tidak ada pending order saat ini.")
+        return
+
+    lines = [f"<b>⏳ Pending Orders ({len(pending)})</b>\n"]
+    for t in pending:
+        entry     = t.get("entry_price")
+        sl        = t.get("sl_price")
+        direction = (t.get("direction") or "?").upper()
+        entry_str = f"{entry:g}" if entry else "?"
+        sl_str    = f"{sl:g}"    if sl    else "?"
+        lines.append(
+            f"• <code>{t['pair']}</code> <b>{direction}</b>\n"
+            f"  Entry: <code>{entry_str}</code> | SL: <code>{sl_str}</code>"
+            f" | #<code>{t['id']}</code>\n"
+            f"  Cancel: <code>/cancel {t['pair']}</code>"
+        )
+    await _send(update, "\n\n".join(lines))
+
+
+# ── /cancel {pair} ────────────────────────────────────────────────────────────
+
+@authorized
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await _send(update,
+            "❌ Format: <code>/cancel {pair}</code>\n"
+            "Contoh: <code>/cancel BTC/USDT:USDT</code>")
+        return
+
+    pair  = context.args[0].upper()
+    trade = await async_get_pending_trade_for_pair(pair)
+    if not trade:
+        await _send(update, f"❌ Tidak ada order <b>PENDING</b> untuk <code>{pair}</code>.")
+        return
+
+    entry_str = f"{trade['entry_price']:g}" if trade.get("entry_price") else "?"
+    direction = (trade.get("direction") or "?").upper()
+    await _send_confirm_with_ttl(
+        update, context,
+        f"⚠️ <b>Cancel Pending Order</b>\n\n"
+        f"Pair  : <code>{pair}</code>\n"
+        f"Arah  : <b>{direction}</b>\n"
+        f"Entry : <code>{entry_str}</code>\n"
+        f"Trade : #{trade['id']}",
+        action="cancel",
+        pair=pair, trade_id=trade["id"],
+    )
+
+
+# ── /pause ────────────────────────────────────────────────────────────────────
+
+@authorized
+async def cmd_pause(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if is_bot_paused():
+        await _send(update,
+            "ℹ️ Bot sudah dalam mode <b>PAUSE</b>.\n"
+            "Gunakan <code>/resume</code> untuk melanjutkan.")
+        return
+    set_bot_paused(True)
+    logger.info("Bot di-pause via /pause command")
+    await _send(
+        update,
+        "⏸ <b>Bot di-PAUSE</b>\n\n"
+        "Sinyal baru tidak akan dieksekusi.\n"
+        "Posisi yang sudah open tetap dipantau.\n\n"
+        "Aktifkan kembali: <code>/resume</code>"
+    )
+
+
+# ── /resume ───────────────────────────────────────────────────────────────────
+
+@authorized
+async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_bot_paused():
+        await _send(update, "ℹ️ Bot sedang <b>AKTIF</b> — tidak dalam mode pause.")
+        return
+    set_bot_paused(False)
+    logger.info("Bot di-resume via /resume command")
+    await _send(
+        update,
+        "▶️ <b>Bot AKTIF kembali</b>\n\n"
+        "Bot akan eksekusi sinyal baru sesuai setting.\n\n"
+        "Cek status: <code>/status</code> | <code>/settings</code>"
+    )
+
+
+# ── Callback query handler ────────────────────────────────────────────────────
+
+async def handle_position_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Handler inline button konfirmasi posisi (callback_data prefix 'pos:')."""
+    query = update.callback_query
+    await query.answer()
+
+    data  = query.data or ""
+    if not data.startswith("pos:"):
+        return
+
+    parts = data.split(":")
+    if len(parts) != 3:
+        return
+
+    _, key, choice = parts
+    payload = pending_store.pop(key)
+
+    if payload is None:
+        await query.edit_message_text(
+            "⚠️ Konfirmasi sudah kedaluwarsa atau sudah diproses.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if choice == "n":
+        await query.edit_message_text("❌ <b>Dibatalkan.</b>", parse_mode=ParseMode.HTML)
+        return
+
+    # choice == "y"
+    action = payload["action"]
+    try:
+        if action == "settp":
+            result_text = await _exec_settp(payload)
+        elif action == "setsl":
+            result_text = await _exec_setsl(payload)
+        elif action == "setentry":
+            result_text = await _exec_setentry(payload)
+        elif action == "close":
+            result_text = await _exec_close(payload)
+        elif action == "closeall":
+            result_text = await _exec_closeall(payload)
+        elif action == "cancel":
+            result_text = await _exec_cancel(payload)
+        else:
+            result_text = f"❌ Aksi tidak dikenali: <code>{action}</code>"
+    except Exception as exc:
+        logger.exception("[position_callback] Unexpected error action=%s: %s", action, exc)
+        result_text = f"❌ Error tidak terduga: {exc}"
+
+    await query.edit_message_text(result_text, parse_mode=ParseMode.HTML)
+
+
+# ── Executor helpers ──────────────────────────────────────────────────────────
+
+async def _exec_settp(p: dict) -> str:
+    pair, trade_id, price = p["pair"], p["trade_id"], p["price"]
+    try:
+        ok = await async_update_trade_tp(trade_id, price)
+    except Exception as exc:
+        return f"❌ Error saat set TP: {exc}"
+    if ok:
+        return (
+            f"✅ <b>Take Profit diset</b>\n\n"
+            f"Pair  : <code>{pair}</code>\n"
+            f"TP    : <code>{price:g}</code>\n"
+            f"Trade : #{trade_id}\n\n"
+            f"<i>Dicatat di DB. Tutup posisi manual saat TP tercapai.</i>"
+        )
+    return f"❌ Gagal set TP — trade #{trade_id} tidak ditemukan."
+
+
+async def _exec_setsl(p: dict) -> str:
+    pair, trade_id, price = p["pair"], p["trade_id"], p["price"]
+    result = await set_stop_loss(trade_id, price)
+    if result.success:
+        dry_tag = "🔵 [DRY-RUN] " if result.is_dry_run else ""
+        sl_id   = f"\nSL order ID : <code>{result.sl_order_id}</code>" if result.sl_order_id else ""
+        return (
+            f"{dry_tag}✅ <b>Stop Loss diupdate</b>\n\n"
+            f"Pair    : <code>{pair}</code>\n"
+            f"SL baru : <code>{price:g}</code>\n"
+            f"Trade   : #{trade_id}{sl_id}"
+        )
+    crit = "🔴 CRITICAL — " if result.is_critical else ""
+    return f"❌ {crit}Gagal update SL: {result.failure_reason}"
+
+
+async def _exec_setentry(p: dict) -> str:
+    pair, trade_id, price = p["pair"], p["trade_id"], p["price"]
+    try:
+        ok = await async_update_trade_entry(trade_id, price)
+    except Exception as exc:
+        return f"❌ Error saat set entry: {exc}"
+    if ok:
+        return (
+            f"✅ <b>Entry price diupdate</b>\n\n"
+            f"Pair       : <code>{pair}</code>\n"
+            f"Entry baru : <code>{price:g}</code>\n"
+            f"Trade      : #{trade_id}\n\n"
+            f"<i>Perhatian: limit order di exchange tidak otomatis berubah.\n"
+            f"Gunakan <code>/cancel {pair}</code> lalu biarkan sinyal baru masuk.</i>"
+        )
+    return f"❌ Gagal update entry — trade #{trade_id} tidak ditemukan."
+
+
+async def _exec_close(p: dict) -> str:
+    pair, trade_id = p["pair"], p["trade_id"]
+    result = await close_position(trade_id, close_reason=CloseReason.MANUAL)
+    if result.success:
+        dry_tag = "🔵 [DRY-RUN] " if result.is_dry_run else ""
+        pnl_str = f"{result.closed_pnl:+.4f} USDT" if result.closed_pnl is not None else "N/A"
+        return (
+            f"{dry_tag}✅ <b>Posisi closed</b>\n\n"
+            f"Pair     : <code>{pair}</code>\n"
+            f"PnL est. : <code>{pnl_str}</code>\n"
+            f"Trade    : #{trade_id}"
+        )
+    crit = "🔴 CRITICAL — " if result.is_critical else ""
+    return f"❌ {crit}Gagal close posisi: {result.failure_reason}"
+
+
+async def _exec_closeall(_p: dict) -> str:
+    result = await close_all_positions(close_reason=CloseReason.MANUAL)
+    return result.notification_text()
+
+
+async def _exec_cancel(p: dict) -> str:
+    pair, trade_id = p["pair"], p["trade_id"]
+    result = await cancel_pending_order(trade_id)
+    if result.success:
+        dry_tag = "🔵 [DRY-RUN] " if result.is_dry_run else ""
+        return (
+            f"{dry_tag}✅ <b>Order dibatalkan</b>\n\n"
+            f"Pair  : <code>{pair}</code>\n"
+            f"Trade : #{trade_id}"
+        )
+    crit = "🔴 CRITICAL — " if result.is_critical else ""
+    return f"❌ {crit}Gagal cancel order: {result.failure_reason}"

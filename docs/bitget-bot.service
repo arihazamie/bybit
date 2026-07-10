@@ -1,0 +1,32 @@
+[Unit]
+Description=Bitget Signal Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/bitget-signal-bot
+Environment="PATH=/home/ubuntu/bitget-signal-bot/.venv/bin"
+ExecStart=/home/ubuntu/bitget-signal-bot/.venv/bin/python main.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/var/log/bitget-bot/service.log
+StandardError=append:/var/log/bitget-bot/service_error.log
+
+# Batas resource
+MemoryMax=512M
+CPUQuota=50%
+
+[Install]
+WantedBy=multi-user.target
+
+# ── Cara install ──────────────────────────────────────────────────────────
+# sudo mkdir -p /var/log/bitget-bot
+# sudo chown ubuntu:ubuntu /var/log/bitget-bot
+# sudo cp docs/bitget-bot.service /etc/systemd/system/
+# sudo systemctl daemon-reload
+# sudo systemctl enable bitget-bot
+# sudo systemctl start bitget-bot
+# sudo systemctl status bitget-bot
+# journalctl -u bitget-bot -f     ← tail log via systemd
