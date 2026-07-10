@@ -599,7 +599,7 @@ async def test_invalid_pair_rejected():
     cache = get_default_market_cache()
     eval_result = await evaluate_signal(
         INVALID_SIGNAL,
-        market_validator=cache.validate_pair,
+        market_validator=cache.find_symbol,   # sebelumnya: cache.validate_pair
     )
 
     assert eval_result.parse_status in (ParseStatus.AMBIGUOUS, ParseStatus.SUCCESS), (

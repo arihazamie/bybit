@@ -319,7 +319,7 @@ async def _record_trade(
         leverage_used=float(leverage_used),
         leverage_auto_adjusted=safety.leverage_adjusted,
         liquidation_price_estimate=(
-            safety.projection.liq_price_estimate if safety.projection else None
+            safety.projection.liquidation_price if safety.projection else None
         ),
         status=status,
         opened_at=_utcnow() if status == TradeStatus.OPEN else None,

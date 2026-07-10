@@ -128,7 +128,7 @@ class SignalPipeline:
         try:
             cache = get_default_market_cache()
             evaluation = await evaluate_signal(
-                text, market_validator=cache.validate_pair
+                text, market_validator=cache.find_symbol
             )
         except Exception as exc:
             logger.exception("[pipeline] evaluate_signal error: %s", exc)

@@ -295,7 +295,13 @@ class BitgetRestClient:
 
         # Format Bitget V2: {'code': '00000', 'data': [{...}], 'msg': 'success'}
         # Format Bitget V1: bisa langsung dict atau {'data': {...}}
-        data_list = raw_info.get("data") or []
+        if isinstance(raw_info, list):
+            data_list = raw_info
+        elif isinstance(raw_info, dict):
+            data_list = raw_info.get("data") or []
+        else:
+            data_list = []
+
 
         if isinstance(data_list, list) and data_list:
             # V2 format — ambil account USDT-M pertama dari list
@@ -830,3 +836,30 @@ async def reset_rest_client() -> None:
         await _default_client.close()
         _default_client = None
         logger.info("[rest_client] Singleton client reset")
+
+
+@with_retry()
+async def set_one_way_position_mode(self) -> None:
+    """
+    Set posisi mode akun ke ONE-WAY (unilateral) — wajib supaya order
+    tanpa posSide/tradeSide (seperti yang dikirim executor) diterima Bitget.
+    Akun baru/sandbox Bitget kadang default ke HEDGE mode, yang menyebabkan
+    error 40774 saat create_order tanpa posSide.
+
+    Ini level akun (productType), bukan per-simbol — cukup dipanggil sekali
+    saat startup, bukan setiap entry.
+    """
+    try:
+        exchange = await self._get_exchange()
+        await exchange.set_position_mode(False, params={"productType": "USDT-FUTURES"})
+        logger.info("[rest_client] Position mode set ke ONE-WAY (unilateral) ✓")
+    except (CriticalError, TransientError):
+        raise
+    except Exception as exc:
+        msg = str(exc).lower()
+        if "already" in msg or "no change" in msg:
+            logger.debug("[rest_client] Position mode sudah ONE-WAY (no-op)")
+        else:
+            raise CriticalError(
+                f"[set_one_way_position_mode] Gagal set position mode: {exc}", original=exc,
+            ) from exc

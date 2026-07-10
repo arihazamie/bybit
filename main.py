@@ -91,8 +91,12 @@ async def main() -> None:
 
     # ── WebSocket monitor ────────────────────────────────────────────────
     # Butuh BITGET_API_KEY, BITGET_API_SECRET, BITGET_PASSPHRASE valid di .env.
+  # ── WebSocket monitor ────────────────────────────────────────────────
+    # Butuh BITGET_API_KEY, BITGET_API_SECRET, BITGET_PASSPHRASE valid di .env.
     from exchange.bitget.ws_client import get_ws_client
-    ws = get_ws_client()
+    from bot.executor.order_sync import on_order_event, on_position_event
+
+    ws = get_ws_client(on_order=on_order_event, on_position=on_position_event)
     await ws.start()
     logger.info("WebSocket monitor started.")
 

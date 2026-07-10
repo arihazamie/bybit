@@ -31,6 +31,8 @@ from bot.control_bot.inline.signal_confirm import handle_signal_callback
 from bot.control_bot.inline.conflict_confirm import handle_conflict_callback
 from config.settings import settings
 
+from bot.control_bot.commands.help import cmd_help, set_bot_commands
+
 logger = logging.getLogger(__name__)
 
 
@@ -47,6 +49,8 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("history",   cmd_history))
     app.add_handler(CommandHandler("settings",  cmd_settings))
     app.add_handler(CommandHandler("status",    cmd_status))
+    app.add_handler(CommandHandler("help",  cmd_help))
+    app.add_handler(CommandHandler("start", cmd_help))
 
     # ── Step 16: Risk & leverage ───────────────────────────────────────
     app.add_handler(CommandHandler("setrisk",      cmd_setrisk))
@@ -86,6 +90,7 @@ async def start_control_bot() -> None:
 
     async with app:
         await app.start()
+        await set_bot_commands(app)
         await app.updater.start_polling(
             allowed_updates=["message", "callback_query"],
             drop_pending_updates=True,
