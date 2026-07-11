@@ -12,6 +12,7 @@ Perubahan step 18:
 
 from __future__ import annotations
 
+import asyncio
 from typing import Optional
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -26,7 +27,7 @@ from bot.executor.order_manager import (
     close_position,
     set_stop_loss,
 )
-from core.constants import CloseReason
+from core.constants import CloseReason, Direction
 from core.logging_setup import get_logger
 from config.settings import settings
 from db.crud.settings import is_bot_paused, set_bot_paused
@@ -44,10 +45,77 @@ logger = get_logger(__name__)
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+async def _reconcile_before_action() -> None:
+    """
+    Cross-check DB open/pending trades vs posisi & order LIVE di exchange
+    SEBELUM command ini melihat/mengubah sebuah trade. Tanpa ini, /settp,
+    /setsl, /close, dll bisa beroperasi di atas trade yang sebenarnya sudah
+    ditutup manual di exchange tapi belum ke-sync ke DB (gap WS/reconciliation)
+    — hasilnya membingungkan (order gagal aneh) atau, lebih parah, keputusan
+    diambil berdasarkan data posisi yang sudah tidak ada.
+
+    Dibungkus timeout supaya command TIDAK PERNAH hang menunggu exchange —
+    kalau reconcile lambat/gagal, command tetap lanjut pakai data DB terakhir
+    (fail-open, dengan log warning) daripada macet total.
+    """
+    try:
+        from bot.executor.order_sync import reconcile_on_startup
+        await asyncio.wait_for(reconcile_on_startup(), timeout=8.0)
+    except asyncio.TimeoutError:
+        logger.warning("[position] Live reconciliation timeout (>8s) sebelum aksi — lanjut pakai data DB terakhir.")
+    except Exception as exc:  # noqa: BLE001 — command tetap lanjut, DB lama dipakai sbg fallback
+        logger.warning(f"[position] Live reconciliation gagal sebelum aksi: {exc}")
+
+
 async def _send(update: Update, text: str, reply_markup=None):
     return await update.message.reply_text(
         text, parse_mode=ParseMode.HTML, reply_markup=reply_markup
     )
+
+
+def _validate_tp_side(direction: str, entry: Optional[float], price: float) -> Optional[str]:
+    """
+    Cek TP berada di sisi yang benar relatif ke entry berdasarkan arah posisi.
+    LONG  -> TP wajib DI ATAS entry (profit saat harga naik).
+    SHORT -> TP wajib DI BAWAH entry (profit saat harga turun).
+    Return pesan error jika invalid, None jika valid (atau entry tidak diketahui).
+    """
+    if entry is None:
+        return None
+    d = (direction or "").lower()
+    if d == Direction.LONG and price <= entry:
+        return (
+            f"❌ TP tidak valid untuk posisi LONG.\n"
+            f"TP (<code>{price:g}</code>) harus <b>di atas</b> entry (<code>{entry:g}</code>)."
+        )
+    if d == Direction.SHORT and price >= entry:
+        return (
+            f"❌ TP tidak valid untuk posisi SHORT.\n"
+            f"TP (<code>{price:g}</code>) harus <b>di bawah</b> entry (<code>{entry:g}</code>)."
+        )
+    return None
+
+
+def _validate_sl_side(direction: str, entry: Optional[float], price: float) -> Optional[str]:
+    """
+    Cek SL berada di sisi yang benar relatif ke entry berdasarkan arah posisi.
+    LONG  -> SL wajib DI BAWAH entry.
+    SHORT -> SL wajib DI ATAS entry.
+    """
+    if entry is None:
+        return None
+    d = (direction or "").lower()
+    if d == Direction.LONG and price >= entry:
+        return (
+            f"❌ SL tidak valid untuk posisi LONG.\n"
+            f"SL (<code>{price:g}</code>) harus <b>di bawah</b> entry (<code>{entry:g}</code>)."
+        )
+    if d == Direction.SHORT and price <= entry:
+        return (
+            f"❌ SL tidak valid untuk posisi SHORT.\n"
+            f"SL (<code>{price:g}</code>) harus <b>di atas</b> entry (<code>{entry:g}</code>)."
+        )
+    return None
 
 
 def _confirm_kb(key: str) -> InlineKeyboardMarkup:
@@ -116,6 +184,7 @@ async def cmd_settp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await _send(update, "❌ Harga harus lebih dari 0.")
         return
 
+    await _reconcile_before_action()
     trade = await async_get_open_trade_for_pair(pair)
     if not trade:
         await _send(update, f"❌ Tidak ada posisi <b>OPEN</b> untuk <code>{pair}</code>.")
@@ -124,6 +193,12 @@ async def cmd_settp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     direction = (trade.get("direction") or "?").upper()
     entry     = trade.get("entry_price")
     entry_str = f"{entry:g}" if entry else "?"
+
+    err = _validate_tp_side(trade.get("direction") or "", entry, price)
+    if err:
+        await _send(update, err)
+        return
+
     await _send_confirm_with_ttl(
         update, context,
         f"⚠️ <b>Set Take Profit</b>\n\n"
@@ -158,6 +233,7 @@ async def cmd_setsl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await _send(update, "❌ Harga harus lebih dari 0.")
         return
 
+    await _reconcile_before_action()
     trade = await async_get_open_trade_for_pair(pair)
     if not trade:
         await _send(update, f"❌ Tidak ada posisi <b>OPEN</b> untuk <code>{pair}</code>.")
@@ -166,6 +242,13 @@ async def cmd_setsl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     old_sl  = trade.get("sl_price")
     old_str = f"{old_sl:g}" if old_sl else "tidak ada"
     direction = (trade.get("direction") or "?").upper()
+    entry     = trade.get("entry_price")
+
+    err = _validate_sl_side(trade.get("direction") or "", entry, price)
+    if err:
+        await _send(update, err)
+        return
+
     await _send_confirm_with_ttl(
         update, context,
         f"⚠️ <b>Update Stop Loss</b>\n\n"
@@ -199,6 +282,7 @@ async def cmd_setentry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await _send(update, "❌ Harga harus lebih dari 0.")
         return
 
+    await _reconcile_before_action()
     trade = await async_get_pending_trade_for_pair(pair)
     if not trade:
         await _send(update, f"❌ Tidak ada order <b>PENDING</b> untuk <code>{pair}</code>.")
@@ -232,6 +316,7 @@ async def cmd_close(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     pair  = context.args[0].upper()
+    await _reconcile_before_action()
     trade = await async_get_open_trade_for_pair(pair)
     if not trade:
         await _send(update, f"❌ Tidak ada posisi <b>OPEN</b> untuk <code>{pair}</code>.")
@@ -260,6 +345,7 @@ async def cmd_close(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 @authorized
 async def cmd_closeall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _reconcile_before_action()
     open_trades = await async_get_open_trades()
     if not open_trades:
         await _send(update, "ℹ️ Tidak ada posisi open saat ini.")

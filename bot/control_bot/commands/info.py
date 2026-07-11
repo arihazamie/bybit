@@ -11,6 +11,7 @@ Handler info commands (read-only):
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from telegram import Update
@@ -26,11 +27,42 @@ from bot.control_bot.formatters import (
     fmt_status,
 )
 from db.crud.settings import get_all_settings, is_bot_paused
-from db.crud.trades import get_closed_trades, get_open_trades, get_open_trades_summary, get_daily_stats
+from db.crud.trades import (
+    async_get_open_trades,
+    async_get_open_trades_summary,
+    get_closed_trades,
+    get_daily_stats,
+)
 from db.crud.circuit_breaker import get_all_cb_states
 from db.database import check_db_health
 
 logger = logging.getLogger(__name__)
+
+
+async def _reconcile_before_read() -> None:
+    """
+    Cross-check DB open/pending trades vs posisi & order LIVE di exchange
+    sebelum menampilkan /positions atau /dashboard. Tanpa ini, kalau WS
+    sempat putus atau reconciliation loop belum sempat jalan (interval
+    default 60 detik), command ini bisa menampilkan posisi "open" yang
+    sebenarnya sudah ditutup manual di exchange — laporan jadi menyesatkan
+    dan berbahaya untuk keputusan trading berikutnya.
+
+    Memakai jalur yang sama dengan startup reconciliation (order_sync.py)
+    supaya close/cancel yang terdeteksi di sini juga tercatat & dinotifikasi
+    dengan cara yang konsisten (close_reason, PnL, dst), bukan cuma "hilang
+    diam-diam" dari laporan.
+
+    Dibungkus timeout supaya /positions dan /dashboard TIDAK PERNAH hang
+    menunggu exchange — fail-open ke data DB terakhir kalau reconcile lambat.
+    """
+    try:
+        from bot.executor.order_sync import reconcile_on_startup
+        await asyncio.wait_for(reconcile_on_startup(), timeout=8.0)
+    except asyncio.TimeoutError:
+        logger.warning("Live reconciliation timeout (>8s) sebelum /positions atau /dashboard.")
+    except Exception as exc:  # noqa: BLE001 — laporan tetap harus tampil walau reconcile gagal
+        logger.warning(f"Live reconciliation gagal sebelum /positions atau /dashboard: {exc}")
 
 
 async def _fetch_balance():
@@ -50,8 +82,9 @@ async def _send(update: Update, text: str) -> None:
 
 @authorized
 async def cmd_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _reconcile_before_read()
     balance = await _fetch_balance()
-    summary = get_open_trades_summary()
+    summary = await async_get_open_trades_summary()
     daily = get_daily_stats()
     paused = is_bot_paused()
     await _send(update, fmt_dashboard(balance, summary, daily, paused))
@@ -59,7 +92,8 @@ async def cmd_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 @authorized
 async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    trades = get_open_trades()
+    await _reconcile_before_read()
+    trades = await async_get_open_trades()
     await _send(update, fmt_positions(trades))
 
 
