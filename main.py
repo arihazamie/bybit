@@ -94,9 +94,21 @@ async def main() -> None:
   # ── WebSocket monitor ────────────────────────────────────────────────
     # Butuh BITGET_API_KEY, BITGET_API_SECRET, BITGET_PASSPHRASE valid di .env.
     from exchange.bitget.ws_client import get_ws_client
-    from bot.executor.order_sync import on_order_event, on_position_event
+    from bot.executor.order_sync import (
+        get_known_open_symbols,
+        on_order_event,
+        on_position_event,
+        reconcile_on_startup,
+    )
+
+    # Tutup gap posisi/order yang sudah closed/cancelled SAAT bot offline,
+    # SEBELUM WS mulai jalan — supaya trade OPEN/PENDING lama di database
+    # tidak "nyangkut" kalau ternyata sudah selesai di exchange.
+    await reconcile_on_startup()
 
     ws = get_ws_client(on_order=on_order_event, on_position=on_position_event)
+    open_symbols, pending_symbols = await get_known_open_symbols()
+    ws.seed_known_open_state(open_symbols, pending_symbols)
     await ws.start()
     logger.info("WebSocket monitor started.")
 

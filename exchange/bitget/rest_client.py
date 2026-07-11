@@ -683,6 +683,39 @@ class BitgetRestClient:
                 f"[fetch_positions] Unexpected error: {exc}", original=exc
             ) from exc
 
+    @with_retry()
+    async def fetch_closed_orders(
+        self,
+        symbol: str,
+        since: Optional[int] = None,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """
+        Fetch histori order yang sudah tidak aktif (filled/cancelled/expired)
+        untuk satu simbol — dipakai order_sync (Step 19+) untuk mencari order
+        penutup posisi yang SEBENARNYA terjadi di exchange (SL trigger fill,
+        TP trigger fill, atau market/limit close manual), supaya close_reason
+        & harga exit yang dicatat ke database akurat, bukan cuma tebakan.
+
+        Return: list raw ccxt order dict (unified format), terurut apa adanya
+        dari ccxt (caller yang sort/filter sesuai kebutuhan).
+        """
+        try:
+            exchange = await self._get_exchange()
+            params: Dict[str, Any] = {"type": "swap"}
+            orders = await exchange.fetch_closed_orders(symbol, since, limit, params=params)
+            return orders or []
+        except (CriticalError, TransientError):
+            raise
+        except ccxt.NetworkError as exc:
+            raise TransientError(
+                f"[fetch_closed_orders] Network error: {exc}", original=exc
+            ) from exc
+        except Exception as exc:
+            raise CriticalError(
+                f"[fetch_closed_orders] Unexpected error: {exc}", original=exc
+            ) from exc
+
     # ── Ticker / harga pasar ────────────────────────────────────────────
     # Dipakai oleh risk_engine (Step 9) untuk estimasi entry_price saat
     # sinyal "Entry market" datang TANPA harga eksplisit — perhitungan

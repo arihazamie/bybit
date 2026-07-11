@@ -204,6 +204,24 @@ class BitgetWsClient:
         self.orders_reconnect_count: int = 0
         self.positions_reconnect_count: int = 0
 
+        # ── "Known open" cache — dipakai reconciliation untuk deteksi gap ──
+        # Beberapa exchange (termasuk Bitget lewat ccxt.pro) TIDAK selalu
+        # mengirim event eksplisit contracts=0 lewat watch_positions() saat
+        # posisi ditutup (SL/TP/manual/liquidasi) — posisi itu cuma "hilang"
+        # dari snapshot berikutnya. Kalau event WS itu ter-drop (mis. koneksi
+        # putus tepat saat user close manual di web/app), reconciliation lama
+        # TIDAK PERNAH bisa menangkapnya karena posisi yang sudah closed juga
+        # tidak muncul lagi di fetch_positions() REST — bukan cuma di-skip.
+        #
+        # Fix: simpan simbol/pair yang terakhir diketahui MASIH open (dari
+        # WS maupun reconciliation manapun). Setiap siklus reconciliation,
+        # bandingkan simbol open sebelumnya vs simbol open saat ini — simbol
+        # yang hilang dianggap closed/cancelled dan di-dispatch secara
+        # sintetis, supaya cancel/close manual tetap tertangkap real-time
+        # walau event WS aslinya ter-drop.
+        self._known_open_position_symbols: set[str] = set()
+        self._known_open_order_symbols: set[str] = set()
+
     # ── Lifecycle ────────────────────────────────────────────────────────
 
     async def _get_ws_exchange(self) -> ccxtpro.bitget:
@@ -384,11 +402,14 @@ class BitgetWsClient:
         sebagai jaring pengaman — bukan jalur utama deteksi realtime, tapi
         memastikan tidak ada event yang ter-miss kalau WebSocket sempat gap.
         """
+        first_cycle = True
         while self._running:
-            try:
-                await asyncio.sleep(self._reconcile_interval)
-            except asyncio.CancelledError:
-                raise
+            if not first_cycle:
+                try:
+                    await asyncio.sleep(self._reconcile_interval)
+                except asyncio.CancelledError:
+                    raise
+            first_cycle = False
 
             if not self._running:
                 break
@@ -404,7 +425,14 @@ class BitgetWsClient:
                 logger.error("[ws_client] Reconciliation gagal: %s", exc, exc_info=True)
 
     async def _reconcile_once(self) -> None:
-        """Satu siklus reconciliation: fetch open orders + positions via REST, dispatch."""
+        """
+        Satu siklus reconciliation: fetch open orders + positions via REST,
+        dispatch, LALU bandingkan dengan simbol yang sebelumnya diketahui
+        open — simbol yang hilang (vanished) di-dispatch sebagai event
+        sintetis contracts=0 / order closed-cancelled, supaya SL hit / TP
+        hit / close manual / liquidated tetap tercover walau event WS asli
+        untuk kejadian itu ter-drop (lihat docstring `_known_open_*_symbols`).
+        """
         orders = await self._rest.fetch_open_orders()
         positions = await self._rest.fetch_positions()
 
@@ -413,15 +441,33 @@ class BitgetWsClient:
             len(orders), len(positions),
         )
 
+        live_order_symbols = {raw.get("symbol") for raw in orders if raw.get("symbol")}
+        live_position_symbols: set[str] = set()
+
         for raw in orders:
             await self._dispatch_order(raw, source="reconciliation")
 
         for raw in positions:
             contracts = _f(raw.get("contracts")) or 0.0
+            symbol = raw.get("symbol")
             if contracts == 0:
                 # Posisi kosong (sudah closed) — tidak perlu dispatch, hindari noise.
                 continue
+            if symbol:
+                live_position_symbols.add(symbol)
             await self._dispatch_position(raw, source="reconciliation")
+
+        # ── Deteksi gap: simbol yang SEBELUMNYA open tapi sekarang hilang ──
+        vanished_positions = self._known_open_position_symbols - live_position_symbols
+        for symbol in vanished_positions:
+            await self._dispatch_synthetic_closed_position(symbol, source="reconciliation")
+
+        vanished_orders = self._known_open_order_symbols - live_order_symbols
+        for symbol in vanished_orders:
+            # Kalau sekarang ada posisi live untuk simbol itu → order ke-fill.
+            # Kalau tidak → order dibatalkan manual (atau expired) di exchange.
+            filled = symbol in live_position_symbols or symbol in self._known_open_position_symbols
+            await self._dispatch_synthetic_vanished_order(symbol, source="reconciliation", filled=filled)
 
     # ── Parsing & dispatch ───────────────────────────────────────────────
 
@@ -465,6 +511,13 @@ class BitgetWsClient:
     async def _dispatch_order(self, raw: Dict[str, Any], source: str) -> None:
         event = self._parse_order(raw, source)
         self.last_order_event_at = time.time()
+
+        # Update known-open cache — dipakai reconciliation untuk deteksi gap.
+        if event.status == "open":
+            self._known_open_order_symbols.add(event.symbol)
+        else:
+            self._known_open_order_symbols.discard(event.symbol)
+
         logger.info(
             "[ws_client][%s] Order %s %s — status=%s filled=%s/%s%s",
             source, event.symbol, event.order_id, event.status,
@@ -481,6 +534,13 @@ class BitgetWsClient:
     async def _dispatch_position(self, raw: Dict[str, Any], source: str) -> None:
         event = self._parse_position(raw, source)
         self.last_position_event_at = time.time()
+
+        # Update known-open cache — dipakai reconciliation untuk deteksi gap.
+        if event.contracts > 0:
+            self._known_open_position_symbols.add(event.symbol)
+        else:
+            self._known_open_position_symbols.discard(event.symbol)
+
         logger.info(
             "[ws_client][%s] Posisi %s %s — contracts=%s liq=%s",
             source, event.symbol, event.side, event.contracts, event.liquidation_price,
@@ -491,6 +551,103 @@ class BitgetWsClient:
             await self._on_position(event)
         except Exception as exc:
             logger.error("[ws_client] on_position callback error untuk %s: %s", event.symbol, exc, exc_info=True)
+
+    async def _dispatch_synthetic_closed_position(self, symbol: str, source: str) -> None:
+        """
+        Dispatch event posisi closed (contracts=0) yang di-sintesis oleh
+        reconciliation — dipakai saat sebuah simbol yang SEBELUMNYA diketahui
+        open tiba-tiba hilang dari snapshot fetch_positions() REST, tanpa
+        pernah ada event WS eksplisit contracts=0 untuk simbol itu (SL/TP
+        hit, close manual, atau liquidated yang event WS-nya ter-drop).
+        """
+        event = PositionEvent(
+            symbol=symbol,
+            side=None,
+            contracts=0.0,
+            entry_price=None,
+            mark_price=None,
+            liquidation_price=None,
+            unrealized_pnl=None,
+            leverage=None,
+            margin_mode=None,
+            timestamp_ms=None,
+            source=source,
+            raw={},
+        )
+        self._known_open_position_symbols.discard(symbol)
+        self.last_position_event_at = time.time()
+        logger.warning(
+            "[ws_client][%s] Posisi %s hilang dari snapshot exchange (bukan lewat event WS "
+            "eksplisit) — kemungkinan besar SL/TP/close manual/liquidasi yang event-nya "
+            "ter-drop. Dispatch sintetis contracts=0 supaya tetap tercover.",
+            source, symbol,
+        )
+        if self._on_position is None:
+            return
+        try:
+            await self._on_position(event)
+        except Exception as exc:
+            logger.error("[ws_client] on_position callback error (sintetis) untuk %s: %s", symbol, exc, exc_info=True)
+
+    async def _dispatch_synthetic_vanished_order(self, symbol: str, source: str, filled: bool) -> None:
+        """
+        Dispatch event order closed/cancelled yang di-sintesis saat sebuah
+        pending order untuk `symbol` hilang dari fetch_open_orders() REST
+        tanpa pernah ada event WS eksplisit. `filled=True` jika ada posisi
+        live untuk simbol itu sekarang (order ke-fill jadi posisi),
+        `filled=False` jika tidak (order dibatalkan manual di web/app).
+        """
+        event = OrderEvent(
+            symbol=symbol,
+            order_id="",
+            status="closed" if filled else "canceled",
+            side=None,
+            order_type=None,
+            price=None,
+            average=None,
+            filled=0.0,
+            remaining=0.0,
+            trigger_price=None,
+            reduce_only=False,
+            timestamp_ms=None,
+            source=source,
+            raw={},
+        )
+        self._known_open_order_symbols.discard(symbol)
+        self.last_order_event_at = time.time()
+        logger.warning(
+            "[ws_client][%s] Pending order %s hilang dari snapshot exchange (bukan lewat "
+            "event WS eksplisit) — diklasifikasikan sebagai %s. Dispatch sintetis supaya "
+            "cancel/fill manual tetap tercover.",
+            source, symbol, event.status,
+        )
+        if self._on_order is None:
+            return
+        try:
+            await self._on_order(event)
+        except Exception as exc:
+            logger.error("[ws_client] on_order callback error (sintetis) untuk %s: %s", symbol, exc, exc_info=True)
+
+    # ── Seeding known-open state (startup) ──────────────────────────────
+    # Dipanggil main.py SEBELUM start() dengan pair yang berstatus open/pending
+    # di database. Tanpa ini, posisi/order yang closed/cancelled SAAT bot mati
+    # (downtime) tidak akan pernah terdeteksi sebagai "vanished" oleh
+    # reconciliation, karena awalnya cache kosong. Dengan seeding ini, siklus
+    # reconciliation PERTAMA setelah start() langsung bisa mendeteksi gap itu.
+
+    def seed_known_open_state(
+        self,
+        open_position_symbols: Optional[set[str]] = None,
+        open_order_symbols: Optional[set[str]] = None,
+    ) -> None:
+        if open_position_symbols:
+            self._known_open_position_symbols |= set(open_position_symbols)
+        if open_order_symbols:
+            self._known_open_order_symbols |= set(open_order_symbols)
+        logger.info(
+            "[ws_client] Known-open state di-seed dari database — positions=%s orders=%s",
+            self._known_open_position_symbols, self._known_open_order_symbols,
+        )
 
     # ── Diagnostics ──────────────────────────────────────────────────────
 

@@ -137,6 +137,12 @@ RETRY_BACKOFF_SECONDS = (2, 5, 15)   # percobaan ke-1, ke-2, ke-3
 # ── WebSocket reconciliation interval ──────────────────────────────────
 WS_RECONCILE_INTERVAL_SECONDS = 60   # fallback REST polling tiap 1 menit
 
+# ── Close reason classification tolerance ────────────────────────────────
+# Toleransi (dalam %) untuk mencocokkan harga exit real (dari closed order /
+# posisi) terhadap sl_price / tp_price / liquidation_price_estimate yang
+# tersimpan di database saat menentukan close_reason (sl_hit/tp_hit/liquidated).
+CLOSE_PRICE_MATCH_TOLERANCE_PCT = 0.35
+
 # ── Inline button timeout (menit) ──────────────────────────────────────
 INLINE_BUTTON_TIMEOUT_MINUTES = 10   # setelah ini → auto-abaikan sinyal ambigu
 
