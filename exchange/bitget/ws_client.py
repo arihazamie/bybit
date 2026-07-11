@@ -10,10 +10,11 @@ Tanggung jawab modul ini (Step 8):
   2. Reconnect otomatis dengan exponential backoff saat koneksi WebSocket putus
      (network blip, restart exchange, dsb) — loop TIDAK pernah berhenti permanen
      selama client masih `running`, terus mencoba reconnect.
-  3. Fallback REST polling periodik (default tiap 60 detik, lihat
-     `core.constants.WS_RECONCILE_INTERVAL_SECONDS`) sebagai reconciliation —
-     memastikan tidak ada event yang ter-miss kalau WebSocket sempat putus
-     sebentar tanpa exception (silent gap) atau event ter-lewat saat reconnect.
+  3. Fallback REST polling periodik (default tiap 15 detik, dikonfigurasi via
+     `WS_RECONCILE_INTERVAL_SECONDS` di .env / `config.settings`) sebagai
+     reconciliation — memastikan tidak ada event yang ter-miss kalau
+     WebSocket sempat putus sebentar tanpa exception (silent gap) atau
+     event ter-lewat saat reconnect.
 
 PENTING — batas tanggung jawab Step 8:
   - Modul ini HANYA monitoring (read-only stream + reconciliation). Ia tidak
@@ -48,7 +49,6 @@ import ccxt
 import ccxt.pro as ccxtpro
 
 from config.settings import settings
-from core.constants import WS_RECONCILE_INTERVAL_SECONDS
 from core.logging_setup import get_logger
 from exchange.bitget.rest_client import BitgetRestClient
 from exchange.bitget.retry import classify_exception
@@ -170,7 +170,7 @@ class BitgetWsClient:
         on_order: Optional[OrderCallback] = None,
         on_position: Optional[PositionCallback] = None,
         rest_client: Optional[BitgetRestClient] = None,
-        reconcile_interval: float = WS_RECONCILE_INTERVAL_SECONDS,
+        reconcile_interval: Optional[float] = None,
     ) -> None:
         self._api_key = api_key or settings.BITGET_API_KEY
         self._api_secret = api_secret or settings.BITGET_API_SECRET
@@ -179,7 +179,10 @@ class BitgetWsClient:
 
         self._on_order = on_order
         self._on_position = on_position
-        self._reconcile_interval = reconcile_interval
+        self._reconcile_interval = (
+            reconcile_interval if reconcile_interval is not None
+            else settings.WS_RECONCILE_INTERVAL_SECONDS
+        )
 
         # REST client dipakai khusus untuk reconciliation fallback.
         self._rest = rest_client or BitgetRestClient(

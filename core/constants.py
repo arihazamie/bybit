@@ -134,8 +134,8 @@ class EventType:
 # ── Retry backoff (detik) ───────────────────────────────────────────────
 RETRY_BACKOFF_SECONDS = (2, 5, 15)   # percobaan ke-1, ke-2, ke-3
 
-# ── WebSocket reconciliation interval ──────────────────────────────────
-WS_RECONCILE_INTERVAL_SECONDS = 60   # fallback REST polling tiap 1 menit
+# WS_RECONCILE_INTERVAL_SECONDS dipindah ke config/settings.py (Settings.WS_RECONCILE_INTERVAL_SECONDS)
+# supaya bisa dikonfigurasi via .env — lihat exchange/bitget/ws_client.py.
 
 # ── Close reason classification tolerance ────────────────────────────────
 # Toleransi (dalam %) untuk mencocokkan harga exit real (dari closed order /

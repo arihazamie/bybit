@@ -119,6 +119,15 @@ class Settings:
     CIRCUIT_BREAKER_ERROR_THRESHOLD: int = field(default=3)
     CIRCUIT_BREAKER_WINDOW_MINUTES: int = field(default=5)
 
+    # ── WebSocket Reconciliation ────────────────────────────────────────
+    # WS (watch_orders/watch_positions) adalah jalur utama sync realtime —
+    # biasanya update DB dalam hitungan milidetik setelah kejadian di
+    # exchange. Interval ini HANYA jaring pengaman REST polling untuk
+    # kejadian yang event WS-nya ter-drop (koneksi putus di waktu yang
+    # sial). Makin kecil, makin ketat batas atas "delay maksimum" antara
+    # kejadian di exchange dan DB ter-update kalau WS gagal.
+    WS_RECONCILE_INTERVAL_SECONDS: int = field(default=15)
+
     # ── Leverage & Safety ───────────────────────────────────────────────
     LIQUIDATION_BUFFER_PERCENT: float = field(default=0.05) # 5%
 
@@ -228,6 +237,9 @@ def _load_settings() -> Settings:
         # Circuit breaker
         CIRCUIT_BREAKER_ERROR_THRESHOLD=_optional_int("CIRCUIT_BREAKER_ERROR_THRESHOLD", 3),
         CIRCUIT_BREAKER_WINDOW_MINUTES=_optional_int("CIRCUIT_BREAKER_WINDOW_MINUTES", 5),
+
+        # WebSocket reconciliation
+        WS_RECONCILE_INTERVAL_SECONDS=_optional_int("WS_RECONCILE_INTERVAL_SECONDS", 15),
 
         # Leverage & safety
         LIQUIDATION_BUFFER_PERCENT=_optional_float("LIQUIDATION_BUFFER_PERCENT", 0.05),
