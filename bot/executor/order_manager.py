@@ -27,12 +27,18 @@ Scope yang TIDAK dikerjakan di sini:
 Catatan Bitget Futures — Stop Loss order:
   Bitget Futures menyediakan "trigger order" (stop order) di endpoint
   create_order dengan type='stop' / 'stop_market'. ccxt unified API
-  mengekspos ini via create_order(..., params={'stopLossPrice': ...}) atau
-  via create_order dengan type='stop_market' dan triggerPrice.
+  mengekspos ini via create_order(..., params={'stopLossPrice': ...}) ATAU
+  via create_order dengan type='stop_market' dan 'triggerPrice' — TIDAK
+  PERNAH keduanya sekaligus. ccxt bitget createOrder() menolak params yang
+  berisi lebih dari satu dari triggerPrice/stopLossPrice/takeProfitPrice/
+  trailingPercent di saat bersamaan (pernah jadi bug nyata di sini — lihat
+  git history — sampai kirim stopLossPrice+triggerPrice bareng dan semua
+  request set SL gagal dengan CriticalError).
 
   Implementasi menggunakan create_order type='stop_market' (market close
   ketika harga trigger tercapai) dengan params Bitget:
-    - 'stopLossPrice' : harga trigger SL
+    - 'triggerPrice' : harga trigger SL (SATU-SATUNYA dari keempat opsi di
+                        atas yang boleh dipakai di sini)
     - 'side'          : kebalikan posisi (LONG → 'sell', SHORT → 'buy')
     - 'reduceOnly'    : True — HANYA close posisi existing, tidak buka baru
     - 'holdSide'      : 'long' | 'short' — arah posisi yang di-protect
@@ -171,7 +177,13 @@ async def _place_sl_order(
     try:
         exchange = await client._get_exchange()
 
-        # Bitget Futures: stop_market dengan reduceOnly=True
+        # Bitget Futures: stop_market dengan reduceOnly=True.
+        # PENTING: ccxt bitget createOrder() cuma boleh SATU dari
+        # triggerPrice/stopLossPrice/takeProfitPrice/trailingPercent di params
+        # — kirim dua-duanya (stopLossPrice + triggerPrice) ditolak exchange.
+        # Kita pakai triggerPrice saja (konsisten dengan type='stop_market'
+        # sebagai trigger/stop order berdiri sendiri, bukan SL yang nempel
+        # ke posisi lewat stopLossPrice).
         raw = await exchange.create_order(
             symbol=symbol,
             type="stop_market",
@@ -179,7 +191,6 @@ async def _place_sl_order(
             amount=position_size,
             price=None,
             params={
-                "stopLossPrice": sl_price,
                 "triggerPrice": sl_price,
                 "reduceOnly": True,
                 "holdSide": hold_side,

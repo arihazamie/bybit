@@ -148,6 +148,104 @@ async def test_valid_signal_dry_run():
     assert "✅" in result or "Pipeline" in result or "selesai" in result
 
 
+# ── Test 1b: Sinyal MARKET (non dry-run) → set_stop_loss dipanggil dengan
+#             signature yang BENAR (regression test untuk bug TypeError
+#             'pair'/'direction' unexpected keyword argument) ────────────
+
+@pytest.mark.asyncio
+async def test_market_signal_calls_set_stop_loss_with_correct_signature():
+    """
+    Regression test: pipeline sempat memanggil set_stop_loss(trade_id=.., pair=..,
+    direction=.., sl_price=.., rest_client=..) padahal signature aslinya di
+    order_manager.py cuma (trade_id, sl_price, *, rest_client, dry_run) — extra
+    kwargs 'pair'/'direction' bikin TypeError yang ke-swallow diam-diam oleh
+    except Exception generik di _execute_valid_signal, jadi SL TIDAK PERNAH
+    benar-benar terkirim ke exchange walau notifikasi entry sudah "✅ sukses".
+
+    Test ini pakai entry_type=MARKET + DRY_RUN=False (satu-satunya kondisi yang
+    memicu pemanggilan set_stop_loss — lihat test_valid_signal_dry_run yang
+    selalu DRY_RUN=True dan skip jalur ini sepenuhnya) dan assert set_stop_loss
+    dipanggil TANPA kwargs 'pair'/'direction'.
+    """
+    from core.constants import ParseStatus, EntryType, Direction
+
+    evaluation = _make_mock_evaluation(ParseStatus.SUCCESS)
+    evaluation.parsed.entry_type = EntryType.MARKET
+    evaluation.parsed.entry_price = None
+
+    from bot.position_checker.position_checker import PositionCheckResult
+    from bot.risk_engine.risk_engine import RiskCalculationResult
+    from bot.leverage_engine.leverage_engine import LeverageSafetyResult
+    from bot.executor.open_position import ExecutionResult
+    from bot.executor.order_manager import OrderManagementResult
+    from core.constants import PositionAction
+
+    exec_result = ExecutionResult(
+        success=True, pair="STG/USDT:USDT",
+        trade_id=42, is_dry_run=False,
+    )
+    exec_result.notification_text = lambda: "✅ Order placed"
+
+    sl_result = OrderManagementResult(
+        success=True, operation="set_sl", pair="STG/USDT:USDT",
+        trade_id=42, sl_price=0.40,
+    )
+
+    from config.settings import settings as real_settings
+    import dataclasses
+    patched_settings = dataclasses.replace(real_settings, DRY_RUN=False)
+
+    async def _run_coro(component, coro, **kwargs):
+        return await coro
+
+    with (
+        patch("bot.pipeline.signal_pipeline.async_is_bot_paused", return_value=False),
+        patch("bot.pipeline.signal_pipeline.check_position_condition",
+              return_value=PositionCheckResult(
+                  success=True, pair="STG/USDT:USDT",
+                  condition="none", recommended_action=PositionAction.PROCEED,
+              )),
+        patch("bot.pipeline.signal_pipeline.calculate_trade_risk",
+              return_value=RiskCalculationResult(
+                  success=True, sl_price=0.40,
+                  risk_amount_usd=5.0, position_size=100.0,
+                  margin_needed=2.25, leverage_used=20.0,
+                  max_leverage_available=20.0, risk_mode="percent",
+                  entry_price_used=0.45,
+              )),
+        patch("bot.pipeline.signal_pipeline.run_leverage_safety_check",
+              return_value=LeverageSafetyResult(
+                  success=True, leverage_requested=20.0,
+                  leverage_safe=20.0, leverage_adjusted=False,
+              )),
+        patch("bot.pipeline.signal_pipeline.open_position", return_value=exec_result),
+        patch("bot.pipeline.signal_pipeline.set_stop_loss",
+              new_callable=AsyncMock, return_value=sl_result) as mock_sl,
+        patch("bot.pipeline.signal_pipeline.recheck_existing_positions", return_value=[]),
+        patch("bot.pipeline.signal_pipeline.notify", new_callable=AsyncMock),
+        patch("bot.pipeline.signal_pipeline.get_rest_client"),
+        patch("bot.pipeline.signal_pipeline.async_update_signal_action", new_callable=AsyncMock),
+        patch("bot.pipeline.signal_pipeline.get_open_trades", return_value=[]),
+        patch("bot.pipeline.signal_pipeline.settings", patched_settings),
+    ):
+        from bot.pipeline.signal_pipeline import SignalPipeline
+        pipeline = SignalPipeline()
+        pipeline._cb.execute_with_cb = _run_coro
+        result = await pipeline.execute_signal(evaluation, conflict_action=None)
+
+    # Kalau bug signature-nya balik lagi, mock_sl akan gagal di-assert_called_once
+    # (TypeError terjadi SEBELUM/SAAT call, kepatch mock jadi tidak pernah
+    # ke-invoke dengan kwargs yang salah — assert kwargs eksplisit ini yang
+    # jadi jaring pengaman utama).
+    mock_sl.assert_called_once()
+    _, kwargs = mock_sl.call_args
+    assert "pair" not in kwargs, "set_stop_loss dipanggil dengan kwarg 'pair' yang tidak ada di signature aslinya"
+    assert "direction" not in kwargs, "set_stop_loss dipanggil dengan kwarg 'direction' yang tidak ada di signature aslinya"
+    assert kwargs.get("trade_id") == 42
+    assert kwargs.get("sl_price") == 0.40
+    assert "✅" in result or "Pipeline" in result or "selesai" in result
+
+
 # ── Test 2: Sinyal ambigu → tidak eksekusi ───────────────────────────────
 
 @pytest.mark.asyncio

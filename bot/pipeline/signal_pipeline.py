@@ -358,20 +358,40 @@ class SignalPipeline:
 
         # ── Set SL (Step 13) — skip untuk limit order (belum fill) ───
         if parsed.entry_type != EntryType.LIMIT and not settings.DRY_RUN:
-            sl_result: OrderManagementResult = await set_stop_loss(
-                trade_id=exec_result.trade_id,
-                pair=pair,
-                direction=parsed.direction or "long",
-                sl_price=parsed.stop_loss or risk.sl_price or 0.0,
-                rest_client=client,
-            )
-            if not sl_result.success:
+            if exec_result.trade_id is None:
                 await notify(
-                    f"⚠️ Gagal set SL untuk {pair}: {sl_result.failure_reason}\n"
-                    f"Set SL manual segera!"
+                    f"⚠️ Order {pair} terkirim tapi trade_id tidak tercatat di DB "
+                    f"(lihat notif error sebelumnya) — SL TIDAK bisa diset otomatis.\n"
+                    f"Set SL manual segera di exchange!"
                 )
             else:
-                logger.info("[pipeline] SL set sukses untuk %s", pair)
+                try:
+                    sl_result: OrderManagementResult = await set_stop_loss(
+                        trade_id=exec_result.trade_id,
+                        sl_price=parsed.stop_loss or risk.sl_price or 0.0,
+                        rest_client=client,
+                    )
+                except Exception as exc:
+                    # Defense in depth: apapun yang salah di sini (bug baru, error
+                    # tak terduga, dll) TIDAK BOLEH cuma ke-log diam-diam — posisi
+                    # sudah live di exchange TANPA proteksi SL, user wajib tahu
+                    # SEKARANG, bukan nanti pas cek log.
+                    logger.exception(
+                        "[pipeline] set_stop_loss meledak tak terduga untuk %s (trade_id=%s)",
+                        pair, exec_result.trade_id,
+                    )
+                    await notify(
+                        f"🔴 <b>SL GAGAL DISET</b> untuk {pair} (error tak terduga: {exc})\n"
+                        f"Trade #{exec_result.trade_id} — <b>SET SL MANUAL SEKARANG</b> di exchange!"
+                    )
+                else:
+                    if not sl_result.success:
+                        await notify(
+                            f"⚠️ Gagal set SL untuk {pair}: {sl_result.failure_reason}\n"
+                            f"Set SL manual segera!"
+                        )
+                    else:
+                        logger.info("[pipeline] SL set sukses untuk %s", pair)
         elif settings.DRY_RUN:
             logger.info("[pipeline][DRY-RUN] SL tidak dikirim ke exchange.")
 

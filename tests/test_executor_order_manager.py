@@ -131,6 +131,47 @@ async def test_set_stop_loss_dry_run():
 
 
 @pytest.mark.asyncio
+async def test_set_stop_loss_real_order_params_no_conflicting_keys():
+    """
+    Regression test: create_order() sempat dipanggil dengan 'stopLossPrice'
+    DAN 'triggerPrice' di params sekaligus — ccxt bitget menolak ini dengan
+    'createOrder() params can only contain one of triggerPrice, stopLossPrice,
+    takeProfitPrice, trailingPercent', bikin SEMUA /setsl (dan SL otomatis
+    setelah entry) gagal dengan CriticalError. Fix: hanya kirim triggerPrice.
+    """
+    trade = _mock_trade(direction="long", position_size=0.05)
+
+    mock_exchange = AsyncMock()
+    mock_exchange.create_order = AsyncMock(return_value={
+        "id": "SL789", "symbol": "ETH/USDT:USDT",
+    })
+    mock_client = MagicMock()
+    mock_client._get_exchange = AsyncMock(return_value=mock_exchange)
+
+    with (
+        patch("bot.executor.order_manager.async_get_trade_by_id", new_callable=AsyncMock, return_value=trade),
+        patch("bot.executor.order_manager.async_update_trade_sl", new_callable=AsyncMock),
+        patch("bot.executor.order_manager.async_log_event", new_callable=AsyncMock),
+    ):
+        result = await set_stop_loss(1, sl_price=2900.0, rest_client=mock_client, dry_run=False)
+
+    assert result.success, f"set_stop_loss gagal: {result.failure_reason}"
+    mock_exchange.create_order.assert_called_once()
+    _, call_kwargs = mock_exchange.create_order.call_args
+    params = call_kwargs.get("params", {})
+
+    # Cuma boleh SATU dari empat kunci exclusive ini yang dikirim ke ccxt.
+    exclusive_keys = {"triggerPrice", "stopLossPrice", "takeProfitPrice", "trailingPercent"}
+    present = exclusive_keys & params.keys()
+    assert len(present) == 1, (
+        f"params harus punya TEPAT SATU dari {exclusive_keys}, "
+        f"tapi ditemukan: {present} (params={params})"
+    )
+    assert params.get("triggerPrice") == 2900.0
+    assert "stopLossPrice" not in params
+
+
+@pytest.mark.asyncio
 async def test_set_stop_loss_trade_not_found():
     with (
         patch("bot.executor.order_manager.async_get_trade_by_id", new_callable=AsyncMock, return_value=None),
