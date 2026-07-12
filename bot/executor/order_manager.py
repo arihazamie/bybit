@@ -26,17 +26,24 @@ Scope yang TIDAK dikerjakan di sini:
 
 Catatan Bitget Futures — Stop Loss order:
   Bitget Futures menyediakan "trigger order" (stop order) di endpoint
-  create_order dengan type='stop' / 'stop_market'. ccxt unified API
-  mengekspos ini via create_order(..., params={'stopLossPrice': ...}) ATAU
-  via create_order dengan type='stop_market' dan 'triggerPrice' — TIDAK
-  PERNAH keduanya sekaligus. ccxt bitget createOrder() menolak params yang
-  berisi lebih dari satu dari triggerPrice/stopLossPrice/takeProfitPrice/
-  trailingPercent di saat bersamaan (pernah jadi bug nyata di sini — lihat
-  git history — sampai kirim stopLossPrice+triggerPrice bareng dan semua
-  request set SL gagal dengan CriticalError).
+  create_order — TAPI order type (field `orderType` di request Bitget)
+  HANYA boleh 'market' atau 'limit'. TIDAK ADA 'stop_market'/'stop' sebagai
+  order type — itu bug yang pernah ada di sini dan bikin SEMUA set_stop_loss
+  ditolak exchange dengan {"code":"400172","msg":"The order type is
+  illegal"}. Sifat trigger/stop-nya ditandai lewat keberadaan
+  params.triggerPrice (ccxt lalu otomatis set planType='normal_plan' di
+  request) — bukan lewat nama order type.
 
-  Implementasi menggunakan create_order type='stop_market' (market close
-  ketika harga trigger tercapai) dengan params Bitget:
+  ccxt unified API mengekspos trigger order ini via create_order(...,
+  type='market', params={'triggerPrice': ...}) ATAU lewat
+  params={'stopLossPrice': ...} (preset SL yang nempel ke order lain,
+  dipakai open_position.py untuk limit entry) — TIDAK PERNAH keduanya
+  sekaligus. ccxt bitget createOrder() menolak params yang berisi lebih
+  dari satu dari triggerPrice/stopLossPrice/takeProfitPrice/
+  trailingPercent di saat bersamaan.
+
+  Implementasi menggunakan create_order type='market' + params.triggerPrice
+  (market close ketika harga trigger tercapai) dengan params Bitget:
     - 'triggerPrice' : harga trigger SL (SATU-SATUNYA dari keempat opsi di
                         atas yang boleh dipakai di sini)
     - 'side'          : kebalikan posisi (LONG → 'sell', SHORT → 'buy')
@@ -45,8 +52,9 @@ Catatan Bitget Futures — Stop Loss order:
     - 'marginMode'    : 'cross'
     - 'productType'   : 'USDT-FUTURES'
 
-  Jika endpoint stop_market tidak tersedia / ditolak exchange, fallback ke
-  stop order dengan params triggerPrice + closePosition=True.
+  Jika endpoint ini tidak tersedia / ditolak exchange, fallback ke trigger
+  order dengan params triggerPrice + closePosition=True (order type tetap
+  'market', bukan 'stop').
 """
 
 from __future__ import annotations
@@ -177,16 +185,28 @@ async def _place_sl_order(
     try:
         exchange = await client._get_exchange()
 
-        # Bitget Futures: stop_market dengan reduceOnly=True.
+        # Bitget Futures: stop order = order type LIMIT/MARKET biasa + params
+        # triggerPrice (BUKAN 'stop_market'/'stop' sebagai order type!).
+        #
+        # BUG SEBELUMNYA (fix ini): kode lama kirim type="stop_market" ke
+        # exchange.create_order(). ccxt bitget forward string `type` itu
+        # APA ADANYA ke field `orderType` di request Bitget — dan Bitget
+        # HANYA menerima orderType='market' atau 'limit', TIDAK PERNAH
+        # 'stop_market'/'stop'. Sifat "trigger/stop"-nya ditandai lewat
+        # keberadaan params.triggerPrice (ccxt lalu otomatis set
+        # planType='normal_plan' di request), bukan lewat nama order type.
+        # Akibatnya SEMUA panggilan set_stop_loss (baik dari pipeline
+        # otomatis maupun command /setsl manual) selalu ditolak exchange:
+        #   {"code":"400172","msg":"The order type is illegal"}
+        #
         # PENTING: ccxt bitget createOrder() cuma boleh SATU dari
         # triggerPrice/stopLossPrice/takeProfitPrice/trailingPercent di params
         # — kirim dua-duanya (stopLossPrice + triggerPrice) ditolak exchange.
-        # Kita pakai triggerPrice saja (konsisten dengan type='stop_market'
-        # sebagai trigger/stop order berdiri sendiri, bukan SL yang nempel
-        # ke posisi lewat stopLossPrice).
+        # Kita pakai triggerPrice saja (trigger/stop order berdiri sendiri,
+        # bukan SL yang nempel ke posisi lewat stopLossPrice).
         raw = await exchange.create_order(
             symbol=symbol,
-            type="stop_market",
+            type="market",
             side=side,
             amount=position_size,
             price=None,
@@ -205,14 +225,16 @@ async def _place_sl_order(
         return raw
 
     except ccxt.NotSupported:
-        # Fallback: stop order dengan closePosition
+        # Fallback: trigger order dengan closePosition (order type tetap
+        # 'market' — closePosition/holdSide yang membedakan varian, BUKAN
+        # nama order type; lihat penjelasan di atas).
         try:
             raw = await exchange.create_order(
                 symbol=symbol,
-                type="stop",
+                type="market",
                 side=side,
                 amount=position_size,
-                price=sl_price,
+                price=None,
                 params={
                     "triggerPrice": sl_price,
                     "closePosition": True,

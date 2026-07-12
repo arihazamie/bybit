@@ -172,6 +172,45 @@ async def test_set_stop_loss_real_order_params_no_conflicting_keys():
 
 
 @pytest.mark.asyncio
+async def test_set_stop_loss_uses_valid_bitget_order_type():
+    """
+    Regression test: create_order() sempat dipanggil dengan type='stop_market'
+    — ccxt bitget forward string `type` itu APA ADANYA ke field `orderType`
+    di request Bitget, dan Bitget HANYA menerima orderType='market' atau
+    'limit'. Kirim 'stop_market'/'stop' bikin SEMUA /setsl (manual maupun
+    otomatis setelah entry fill) ditolak exchange dengan:
+        {"code":"400172","msg":"The order type is illegal"}
+    Sifat trigger/stop-nya ditandai lewat params.triggerPrice (bukan lewat
+    nama order type) — fix: selalu kirim type='market'.
+    """
+    trade = _mock_trade(direction="long", position_size=0.05)
+
+    mock_exchange = AsyncMock()
+    mock_exchange.create_order = AsyncMock(return_value={
+        "id": "SL790", "symbol": "ETH/USDT:USDT",
+    })
+    mock_client = MagicMock()
+    mock_client._get_exchange = AsyncMock(return_value=mock_exchange)
+
+    with (
+        patch("bot.executor.order_manager.async_get_trade_by_id", new_callable=AsyncMock, return_value=trade),
+        patch("bot.executor.order_manager.async_update_trade_sl", new_callable=AsyncMock),
+        patch("bot.executor.order_manager.async_log_event", new_callable=AsyncMock),
+    ):
+        result = await set_stop_loss(1, sl_price=2900.0, rest_client=mock_client, dry_run=False)
+
+    assert result.success, f"set_stop_loss gagal: {result.failure_reason}"
+    mock_exchange.create_order.assert_called_once()
+    _, call_kwargs = mock_exchange.create_order.call_args
+
+    assert call_kwargs.get("type") == "market", (
+        f"orderType wajib 'market' (Bitget cuma terima 'market'/'limit') — "
+        f"dapat: {call_kwargs.get('type')!r}. Kirim 'stop_market'/'stop' "
+        f"akan ditolak exchange dengan code 400172 'The order type is illegal'."
+    )
+
+
+@pytest.mark.asyncio
 async def test_set_stop_loss_trade_not_found():
     with (
         patch("bot.executor.order_manager.async_get_trade_by_id", new_callable=AsyncMock, return_value=None),
