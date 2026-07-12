@@ -12,7 +12,7 @@ _DUMMY_ENV = {
     "TELEGRAM_API_ID": "12345678",
     "TELEGRAM_API_HASH": "abcdef1234567890abcdef1234567890",
     "TELEGRAM_PHONE": "+628123456789",
-    "TELEGRAM_BOT_TOKEN": "123456789:AABBCCDDEEFFaabbccddeeff1234567890",
+    "TELEGRAM_BOT_TOKEN": "dummy-test-bot-token-not-a-real-secret",
     "TELEGRAM_CONTROL_CHAT_ID": "-100123456789",
     "BITGET_API_KEY": "test_api_key",
     "BITGET_API_SECRET": "test_api_secret",

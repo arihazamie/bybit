@@ -20,8 +20,13 @@ Alur nominal:
       PROCEED/ADD/REPLACE ↓
     ↓ calculate_trade_risk()    [risk engine Step 9]
     ↓ run_leverage_safety_check() [leverage engine Step 10]
-    ↓ open_position()           [executor Step 12]
-    ↓ set_stop_loss()            [executor Step 13]
+    ↓ open_position()           [executor Step 12 — SL wajib attached di request
+                                  kalau LIMIT (params.stopLossPrice), sl_price
+                                  kosong = order ditolak sebelum kirim ke exchange]
+    ↓ set_stop_loss()            [executor Step 13 — HANYA untuk MARKET order
+                                  (fill instan → SL dipasang terpisah setelah
+                                  fill). LIMIT sudah punya SL dari Step 12,
+                                  jadi di-skip di sini supaya tidak dobel.]
     ↓ recheck_existing_positions() [leverage engine Step 10]
     ↓ notify result
 
@@ -410,7 +415,11 @@ class SignalPipeline:
                 )
             return
 
-        # ── Set SL (Step 13) — skip untuk limit order (belum fill) ───
+        # ── Set SL (Step 13) — HANYA untuk market order ─────────────────
+        # Limit order SUDAH wajib bawa SL attached (params.stopLossPrice)
+        # sejak open_position() (Step 12) — kalau sl_price kosong, order
+        # ditolak DI SANA, tidak pernah sampai sini. Panggil set_stop_loss
+        # lagi di sini untuk limit order akan bikin SL DOBEL di exchange.
         if parsed.entry_type != EntryType.LIMIT and not settings.DRY_RUN:
             if exec_result.trade_id is None:
                 await notify(

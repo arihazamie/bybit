@@ -12,8 +12,17 @@ Tanggung jawab:
      (trip circuit breaker — di-raise ke caller, Step 19/circuit breaker Step 14)
   6. Log semua eksekusi ke database (tabel trades + event_log)
 
+Stop Loss:
+  - MARKET order: fill instan → SL dipasang terpisah setelah fill via
+    reduceOnly stop_market order (Step 13, order_manager.set_stop_loss).
+  - LIMIT order: belum fill saat order dikirim, jadi TIDAK bisa pakai
+    reduceOnly (butuh posisi yang sudah ada). SL untuk limit order WAJIB
+    di-attach atomically ke order entry itu sendiri lewat
+    params.stopLossPrice (preset SL Bitget, aktif otomatis begitu limit
+    order fill). sl_price WAJIB ada untuk limit order — kalau kosong,
+    open_position() menolak sebelum order dikirim ke exchange.
+
 Scope yang TIDAK dikerjakan di sini:
-  - Set Stop Loss setelah fill         → Step 13
   - Cancel pending order / close posisi → Step 13
   - Circuit breaker state machine       → Step 14
   - Inline confirmation & timeout       → Step 18
@@ -114,6 +123,14 @@ def _ccxt_side(direction: str) -> str:
     return "buy" if direction == Direction.LONG else "sell"
 
 
+def _hold_side(direction: str) -> str:
+    """
+    'long' | 'short' — dibutuhkan Bitget untuk params.holdSide saat attach
+    preset SL (stopLossPrice) ke order entry. Sama seperti order_manager._hold_side.
+    """
+    return "long" if direction == Direction.LONG else "short"
+
+
 def _to_int_leverage(leverage: float) -> int:
     """Floor leverage ke integer — ccxt.bitget butuh integer."""
     return max(1, math.floor(leverage))
@@ -182,22 +199,36 @@ async def _place_order(
     entry_type: str,
     position_size: float,
     entry_price: Optional[float],
+    sl_price: Optional[float],
     dry_run: bool,
 ) -> Dict[str, Any]:
     """
     Kirim order ke Bitget Futures via ccxt.
+
+    LIMIT order: sl_price WAJIB (>0) — di-attach ke request lewat
+    params.stopLossPrice supaya SL aktif otomatis begitu order fill
+    (posisi belum ada saat order dikirim, jadi reduceOnly stop order
+    terpisah tidak bisa dipakai di sini — lihat docstring modul).
 
     Dry-run: return stub dict tanpa menyentuh exchange.
     Raise CriticalError / TransientError ke caller.
     """
     side = _ccxt_side(direction)
 
+    if entry_type == EntryType.LIMIT and (sl_price is None or sl_price <= 0):
+        raise CriticalError(
+            f"[executor] Limit order untuk {symbol} tapi sl_price kosong/invalid "
+            f"({sl_price}) — SL WAJIB di-set bareng saat limit order dikirim, "
+            "parser/risk engine seharusnya sudah menangkap ini.",
+        )
+
     if dry_run:
         logger.info(
-            "[executor][DRY-RUN] Would place %s %s %s @ %s | size=%g",
+            "[executor][DRY-RUN] Would place %s %s %s @ %s | size=%g%s",
             entry_type.upper(), symbol, side,
             entry_price if entry_type == EntryType.LIMIT else "market",
             position_size,
+            f" | SL(attached)={sl_price:g}" if entry_type == EntryType.LIMIT else "",
         )
         return {
             "id": "DRY_RUN",
@@ -225,9 +256,20 @@ async def _place_order(
                     f"[executor] Limit order untuk {symbol} tapi entry_price=None — "
                     "parser/risk engine seharusnya sudah menangkap ini.",
                 )
+            # sl_price sudah divalidasi wajib ada di atas (guard sebelum dry_run).
+            # stopLossPrice = preset SL Bitget — nempel ke order INI, aktif
+            # otomatis begitu limit order fill. Ini SATU-SATUNYA dari
+            # triggerPrice/stopLossPrice/takeProfitPrice/trailingPercent yang
+            # dikirim (lihat catatan di order_manager.py — kirim >1 sekaligus
+            # ditolak exchange).
             raw = await exchange.create_limit_order(
                 symbol, side, position_size, entry_price,
-                params={"marginMode": "cross", "productType": "USDT-FUTURES"},
+                params={
+                    "marginMode": "cross",
+                    "productType": "USDT-FUTURES",
+                    "stopLossPrice": sl_price,
+                    "holdSide": _hold_side(direction),
+                },
             )
 
         logger.info(
@@ -399,6 +441,19 @@ async def open_position(
             is_critical=False,
         )
 
+    sl_price = signal.stop_loss or risk.sl_price or 0.0
+    if entry_type == EntryType.LIMIT and sl_price <= 0:
+        # SL wajib dikirim BARENGAN order limit (attached via stopLossPrice) —
+        # tidak ada mekanisme "set SL setelah fill" untuk limit order, jadi
+        # kalau sl_price tidak ada, order limit ditolak di sini, sebelum
+        # sempat dikirim ke exchange tanpa proteksi.
+        return ExecutionResult(
+            success=False,
+            pair=pair,
+            failure_reason="limit_order_missing_sl_price",
+            is_critical=False,
+        )
+
     leverage_used = _to_int_leverage(safety.leverage_safe)
     position_size = risk.position_size
     entry_price = signal.entry_price if entry_type == EntryType.LIMIT else None
@@ -450,7 +505,7 @@ async def open_position(
     try:
         order_raw = await _place_order(
             client, pair, direction, entry_type,
-            position_size, entry_price, is_dry,
+            position_size, entry_price, sl_price, is_dry,
         )
     except CriticalError as exc:
         msg = f"Critical error saat place order {pair}: {exc}"

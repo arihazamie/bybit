@@ -40,7 +40,7 @@ from bot.risk_engine.risk_engine import (
     format_risk_notification,
     resolve_leverage_used,
 )
-from core.constants import EntryType, RiskMode
+from core.constants import Direction, EntryType, RiskMode
 from exchange.bitget.retry import CriticalError, TransientError
 from exchange.bitget.rest_client import BalanceInfo
 
@@ -312,10 +312,14 @@ class TestCalculateTradeRiskSuccess(unittest.TestCase):
 
     def test_percent_mode_long_limit(self):
         patch_risk, patch_lev = _patch_settings(RiskMode.PERCENT, 1.0)
-        client = FakeRestClient(total_equity=1000.0, free_margin=1000.0, max_leverage=20.0)
+        client = FakeRestClient(
+            total_equity=1000.0, free_margin=1000.0, max_leverage=20.0,
+            ticker_price=100.0,  # dekat entry_price — lolos sanity-check deviasi
+        )
 
         with patch_risk, patch_lev:
             result = run(calculate_trade_risk(
+                direction=Direction.LONG,
                 pair="BTC/USDT:USDT",
                 entry_type=EntryType.LIMIT,
                 entry_price=100.0,
@@ -337,10 +341,14 @@ class TestCalculateTradeRiskSuccess(unittest.TestCase):
 
     def test_fixed_usd_mode(self):
         patch_risk, patch_lev = _patch_settings(RiskMode.FIXED_USD, 5.0)
-        client = FakeRestClient(total_equity=50_000.0, free_margin=50_000.0, max_leverage=10.0)
+        client = FakeRestClient(
+            total_equity=50_000.0, free_margin=50_000.0, max_leverage=10.0,
+            ticker_price=2.0,  # dekat entry_price — lolos sanity-check deviasi
+        )
 
         with patch_risk, patch_lev:
             result = run(calculate_trade_risk(
+                direction=Direction.LONG,
                 pair="STG/USDT:USDT",
                 entry_type=EntryType.LIMIT,
                 entry_price=2.0,
@@ -364,17 +372,25 @@ class TestCalculateTradeRiskSuccess(unittest.TestCase):
         """
         patch_risk, patch_lev = _patch_settings(RiskMode.PERCENT, 1.0)
 
-        client_near = FakeRestClient(total_equity=1000.0, free_margin=1000.0, max_leverage=20.0)
+        client_near = FakeRestClient(
+            total_equity=1000.0, free_margin=1000.0, max_leverage=20.0,
+            ticker_price=100.0,  # dekat entry_price — lolos sanity-check deviasi
+        )
         with patch_risk, patch_lev:
             near = run(calculate_trade_risk(
+                direction=Direction.LONG,
                 pair="A/USDT:USDT", entry_type=EntryType.LIMIT,
                 entry_price=100.0, sl_price=99.0, rest_client=client_near,
             ))
 
         patch_risk2, patch_lev2 = _patch_settings(RiskMode.PERCENT, 1.0)
-        client_far = FakeRestClient(total_equity=1000.0, free_margin=1000.0, max_leverage=20.0)
+        client_far = FakeRestClient(
+            total_equity=1000.0, free_margin=1000.0, max_leverage=20.0,
+            ticker_price=100.0,  # dekat entry_price — lolos sanity-check deviasi
+        )
         with patch_risk2, patch_lev2:
             far = run(calculate_trade_risk(
+                direction=Direction.LONG,
                 pair="A/USDT:USDT", entry_type=EntryType.LIMIT,
                 entry_price=100.0, sl_price=50.0, rest_client=client_far,
             ))
@@ -387,10 +403,14 @@ class TestCalculateTradeRiskSuccess(unittest.TestCase):
 
     def test_leverage_cap_applied_and_recalculates_margin(self):
         patch_risk, patch_lev = _patch_settings(RiskMode.PERCENT, 1.0, leverage_cap=5.0)
-        client = FakeRestClient(total_equity=1000.0, free_margin=1000.0, max_leverage=50.0)
+        client = FakeRestClient(
+            total_equity=1000.0, free_margin=1000.0, max_leverage=50.0,
+            ticker_price=100.0,  # dekat entry_price — lolos sanity-check deviasi
+        )
 
         with patch_risk, patch_lev:
             result = run(calculate_trade_risk(
+                direction=Direction.LONG,
                 pair="ETH/USDT:USDT", entry_type=EntryType.LIMIT,
                 entry_price=100.0, sl_price=95.0, rest_client=client,
             ))
@@ -410,6 +430,7 @@ class TestCalculateTradeRiskSuccess(unittest.TestCase):
 
         with patch_risk, patch_lev:
             result = run(calculate_trade_risk(
+                direction=Direction.LONG,
                 pair="SOL/USDT:USDT", entry_type=EntryType.MARKET,
                 entry_price=None, sl_price=240.0, rest_client=client,
             ))
@@ -420,20 +441,33 @@ class TestCalculateTradeRiskSuccess(unittest.TestCase):
         self.assertEqual(client.fetch_ticker_price_calls, 1)
         self.assertAlmostEqual(result.sl_distance, 10.0)
 
-    def test_market_order_with_explicit_price_skips_ticker(self):
-        """Kalau sinyal sudah kasih harga market eksplisit, ticker TIDAK perlu dipanggil."""
+    def test_market_order_with_explicit_price_still_sanity_checked(self):
+        """
+        Kalau sinyal sudah kasih harga market eksplisit, ticker TIDAK dipakai
+        untuk estimasi harga entry (entry_price_estimated tetap False) — tapi
+        TETAP dipanggil SATU KALI untuk sanity-check deviasi (bagian 2c):
+        entry_price dari sinyal dibandingkan ke harga live untuk menangkap
+        salah baca digit yang kebetulan masih di sisi SL yang "benar".
+        (Sebelumnya test ini bernama *_skips_ticker dan mengharapkan 0 call —
+        itu valid SEBELUM sanity-check 2c ditambahkan; sekarang 1 call adalah
+        perilaku yang benar & disengaja.)
+        """
         patch_risk, patch_lev = _patch_settings(RiskMode.PERCENT, 1.0)
-        client = FakeRestClient(total_equity=1000.0, free_margin=1000.0, max_leverage=20.0)
+        client = FakeRestClient(
+            total_equity=1000.0, free_margin=1000.0, max_leverage=20.0,
+            ticker_price=250.0,  # dekat entry_price — lolos sanity-check deviasi
+        )
 
         with patch_risk, patch_lev:
             result = run(calculate_trade_risk(
+                direction=Direction.LONG,
                 pair="SOL/USDT:USDT", entry_type=EntryType.MARKET,
                 entry_price=250.0, sl_price=240.0, rest_client=client,
             ))
 
         self.assertTrue(result.success)
         self.assertFalse(result.entry_price_estimated)
-        self.assertEqual(client.fetch_ticker_price_calls, 0)
+        self.assertEqual(client.fetch_ticker_price_calls, 1)
 
 
 class TestCalculateTradeRiskFailure(unittest.TestCase):
@@ -442,10 +476,14 @@ class TestCalculateTradeRiskFailure(unittest.TestCase):
         """Margin dibutuhkan lebih besar dari free_margin → trade dibatalkan."""
         patch_risk, patch_lev = _patch_settings(RiskMode.PERCENT, 1.0)
         # equity besar (risk_amount besar) tapi free_margin sangat kecil & leverage rendah
-        client = FakeRestClient(total_equity=100_000.0, free_margin=1.0, max_leverage=1.0)
+        client = FakeRestClient(
+            total_equity=100_000.0, free_margin=1.0, max_leverage=1.0,
+            ticker_price=100.0,  # dekat entry_price — lolos sanity-check deviasi
+        )
 
         with patch_risk, patch_lev:
             result = run(calculate_trade_risk(
+                direction=Direction.LONG,
                 pair="BTC/USDT:USDT", entry_type=EntryType.LIMIT,
                 entry_price=100.0, sl_price=95.0, rest_client=client,
             ))
@@ -463,6 +501,7 @@ class TestCalculateTradeRiskFailure(unittest.TestCase):
 
         with patch_risk, patch_lev:
             result = run(calculate_trade_risk(
+                direction=Direction.LONG,
                 pair="BTC/USDT:USDT", entry_type=EntryType.LIMIT,
                 entry_price=100.0, sl_price=100.0, rest_client=client,
             ))
@@ -480,6 +519,7 @@ class TestCalculateTradeRiskFailure(unittest.TestCase):
 
         with patch_risk, patch_lev:
             result = run(calculate_trade_risk(
+                direction=Direction.LONG,
                 pair="BTC/USDT:USDT", entry_type=EntryType.LIMIT,
                 entry_price=None, sl_price=95.0, rest_client=client,
             ))
@@ -489,10 +529,14 @@ class TestCalculateTradeRiskFailure(unittest.TestCase):
 
     def test_balance_fetch_critical_error(self):
         patch_risk, patch_lev = _patch_settings(RiskMode.PERCENT, 1.0)
-        client = FakeRestClient(fail_balance=CriticalError("auth gagal"))
+        client = FakeRestClient(
+            fail_balance=CriticalError("auth gagal"),
+            ticker_price=100.0,  # dekat entry_price — lolos sanity-check deviasi
+        )
 
         with patch_risk, patch_lev:
             result = run(calculate_trade_risk(
+                direction=Direction.LONG,
                 pair="BTC/USDT:USDT", entry_type=EntryType.LIMIT,
                 entry_price=100.0, sl_price=95.0, rest_client=client,
             ))
@@ -502,10 +546,14 @@ class TestCalculateTradeRiskFailure(unittest.TestCase):
 
     def test_leverage_fetch_transient_error(self):
         patch_risk, patch_lev = _patch_settings(RiskMode.PERCENT, 1.0)
-        client = FakeRestClient(fail_leverage=TransientError("timeout"))
+        client = FakeRestClient(
+            fail_leverage=TransientError("timeout"),
+            ticker_price=100.0,  # dekat entry_price — lolos sanity-check deviasi
+        )
 
         with patch_risk, patch_lev:
             result = run(calculate_trade_risk(
+                direction=Direction.LONG,
                 pair="BTC/USDT:USDT", entry_type=EntryType.LIMIT,
                 entry_price=100.0, sl_price=95.0, rest_client=client,
             ))
@@ -519,6 +567,7 @@ class TestCalculateTradeRiskFailure(unittest.TestCase):
 
         with patch_risk, patch_lev:
             result = run(calculate_trade_risk(
+                direction=Direction.LONG,
                 pair="BTC/USDT:USDT", entry_type=EntryType.MARKET,
                 entry_price=None, sl_price=95.0, rest_client=client,
             ))
@@ -533,10 +582,14 @@ class TestRecomputeMargin(unittest.TestCase):
 
     def test_recompute_changes_margin_not_risk(self):
         patch_risk, patch_lev = _patch_settings(RiskMode.PERCENT, 1.0)
-        client = FakeRestClient(total_equity=1000.0, free_margin=1000.0, max_leverage=20.0)
+        client = FakeRestClient(
+            total_equity=1000.0, free_margin=1000.0, max_leverage=20.0,
+            ticker_price=100.0,  # dekat entry_price — lolos sanity-check deviasi
+        )
 
         with patch_risk, patch_lev:
             result = run(calculate_trade_risk(
+                direction=Direction.LONG,
                 pair="BTC/USDT:USDT", entry_type=EntryType.LIMIT,
                 entry_price=100.0, sl_price=95.0, rest_client=client,
             ))
@@ -567,10 +620,14 @@ class TestFormatRiskNotification(unittest.TestCase):
 
     def test_success_notification_distinguishes_amounts(self):
         patch_risk, patch_lev = _patch_settings(RiskMode.PERCENT, 1.0)
-        client = FakeRestClient(total_equity=1000.0, free_margin=1000.0, max_leverage=20.0)
+        client = FakeRestClient(
+            total_equity=1000.0, free_margin=1000.0, max_leverage=20.0,
+            ticker_price=100.0,  # dekat entry_price — lolos sanity-check deviasi
+        )
 
         with patch_risk, patch_lev:
             result = run(calculate_trade_risk(
+                direction=Direction.LONG,
                 pair="BTC/USDT:USDT", entry_type=EntryType.LIMIT,
                 entry_price=100.0, sl_price=95.0, rest_client=client,
             ))
@@ -597,10 +654,14 @@ class TestFormatRiskNotification(unittest.TestCase):
 
     def test_leverage_capped_note_included(self):
         patch_risk, patch_lev = _patch_settings(RiskMode.PERCENT, 1.0, leverage_cap=5.0)
-        client = FakeRestClient(total_equity=1000.0, free_margin=1000.0, max_leverage=50.0)
+        client = FakeRestClient(
+            total_equity=1000.0, free_margin=1000.0, max_leverage=50.0,
+            ticker_price=100.0,  # dekat entry_price — lolos sanity-check deviasi
+        )
 
         with patch_risk, patch_lev:
             result = run(calculate_trade_risk(
+                direction=Direction.LONG,
                 pair="ETH/USDT:USDT", entry_type=EntryType.LIMIT,
                 entry_price=100.0, sl_price=95.0, rest_client=client,
             ))
@@ -616,6 +677,7 @@ class TestFormatRiskNotification(unittest.TestCase):
 
         with patch_risk, patch_lev:
             result = run(calculate_trade_risk(
+                direction=Direction.LONG,
                 pair="SOL/USDT:USDT", entry_type=EntryType.MARKET,
                 entry_price=None, sl_price=240.0, rest_client=client,
             ))
