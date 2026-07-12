@@ -42,7 +42,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
-from core.constants import EntryType, RiskMode
+from config.settings import settings
+from core.constants import Direction, EntryType, RiskMode
 from core.logging_setup import get_logger
 from db.crud.settings import async_get_leverage_cap, async_get_risk_amount_config
 from exchange.bitget.retry import CriticalError, TransientError
@@ -95,8 +96,9 @@ class RiskCalculationResult:
 
     # ── Kegagalan & catatan ──────────────────────────────────────────────
     failure_reason: Optional[str] = None
-    # 'invalid_sl_distance' | 'missing_entry_price' | 'insufficient_margin' |
-    # 'exchange_error' | None (kalau success=True)
+    # 'invalid_sl_distance' | 'sl_distance_too_tight' | 'sl_wrong_side' |
+    # 'entry_price_deviation_too_large' | 'missing_entry_price' |
+    # 'insufficient_margin' | 'exchange_error' | None (kalau success=True)
     notes: list = field(default_factory=list)
 
     def recompute_margin(self, leverage_used: float) -> None:
@@ -262,6 +264,7 @@ def resolve_leverage_used(
 async def calculate_trade_risk(
     *,
     pair: str,
+    direction: str,
     entry_type: str,
     entry_price: Optional[float],
     sl_price: float,
@@ -276,6 +279,11 @@ async def calculate_trade_risk(
     Args:
         pair        : unified symbol Bitget (mis. "STG/USDT:USDT") — hasil
                       `ParsedSignal.pair_normalized`
+        direction   : Direction.LONG atau Direction.SHORT — dipakai untuk
+                      validasi sisi SL (LONG wajib sl < entry, SHORT wajib
+                      sl > entry). Sinyal dengan SL di sisi yang salah
+                      hampir selalu berarti salah baca harga (typo/kurang
+                      digit) — lihat validasi di bawah.
         entry_type  : EntryType.LIMIT atau EntryType.MARKET
         entry_price : harga entry dari sinyal. WAJIB untuk limit. Untuk
                       market, BOLEH None (sinyal "Entry market" tanpa harga
@@ -340,6 +348,111 @@ async def calculate_trade_risk(
         )
         return result
     result.sl_distance = sl_distance
+
+    # Jarak SL nol sudah ditolak calculate_sl_distance() di atas — tapi jarak
+    # yang NON-ZERO namun terlalu sempit sama berbahayanya: position_size =
+    # risk_amount / sl_distance akan membengkak tidak wajar (lihat docstring
+    # modul), bikin notional jauh lebih besar dari yang masuk akal untuk
+    # akun manapun — leverage TIDAK BISA memperbaiki ini (leverage cuma
+    # mengubah margin_needed, bukan position_size). Ditolak DI SINI, sebelum
+    # sampai ke leverage_engine/exchange, dengan alasan yang jelas.
+    sl_distance_pct = sl_distance / effective_entry_price
+    if sl_distance_pct < settings.MIN_SL_DISTANCE_PERCENT:
+        result.failure_reason = "sl_distance_too_tight"
+        result.notes.append(
+            f"Jarak SL ke entry cuma {sl_distance_pct * 100:.4f}% "
+            f"(minimum {settings.MIN_SL_DISTANCE_PERCENT * 100:.2f}%) — "
+            f"entry={effective_entry_price:g}, sl={sl_price:g}. Kemungkinan "
+            f"besar salah baca/salah ketik harga SL dari sinyal. Kalaupun "
+            f"benar disengaja, SL sesempit ini akan membuat position_size "
+            f"membengkak sampai TIDAK ADA leverage yang bisa membuatnya "
+            f"aman dari liquidation — trade ini ditolak, bukan dipaksakan."
+        )
+        logger.warning(
+            "[risk_engine] sl_distance_too_tight untuk %s — %.4f%% < min %.2f%% "
+            "(entry=%s sl=%s)",
+            pair, sl_distance_pct * 100, settings.MIN_SL_DISTANCE_PERCENT * 100,
+            effective_entry_price, sl_price,
+        )
+        return result
+
+    # ── 2b. SL harus di sisi yang benar dari entry sesuai direction ──────
+    # LONG  → SL WAJIB di bawah entry (rugi kalau harga turun)
+    # SHORT → SL WAJIB di atas entry (rugi kalau harga naik)
+    # SL di sisi yang salah HAMPIR SELALU berarti salah baca angka dari
+    # sinyal (kurang/lebih digit, salah kolom entry vs SL, dsb) — bukan
+    # setup trading yang valid. Kalau dipaksa jalan, sl_distance yang
+    # terhitung jadi tidak berarti apa-apa (bisa ratusan persen dari
+    # entry), bikin position_size anjlok di bawah minimum order exchange
+    # (persis kasus entry=6834 vs sl=63750 untuk LONG — sl_distance
+    # kehitung 56916, padahal itu bukan "SL jauh", itu "harga entry salah
+    # baca").
+    if direction == Direction.LONG and sl_price >= effective_entry_price:
+        result.failure_reason = "sl_wrong_side"
+        result.notes.append(
+            f"Sinyal LONG tapi SL ({sl_price:g}) >= entry ({effective_entry_price:g}) "
+            f"— untuk LONG, SL wajib di BAWAH entry. Kemungkinan besar salah "
+            f"baca harga entry atau SL dari sinyal (cek digit yang mungkin "
+            f"kurang/tertukar). Trade ditolak."
+        )
+        logger.warning(
+            "[risk_engine] sl_wrong_side (LONG) untuk %s — entry=%s sl=%s",
+            pair, effective_entry_price, sl_price,
+        )
+        return result
+    if direction == Direction.SHORT and sl_price <= effective_entry_price:
+        result.failure_reason = "sl_wrong_side"
+        result.notes.append(
+            f"Sinyal SHORT tapi SL ({sl_price:g}) <= entry ({effective_entry_price:g}) "
+            f"— untuk SHORT, SL wajib di ATAS entry. Kemungkinan besar salah "
+            f"baca harga entry atau SL dari sinyal (cek digit yang mungkin "
+            f"kurang/tertukar). Trade ditolak."
+        )
+        logger.warning(
+            "[risk_engine] sl_wrong_side (SHORT) untuk %s — entry=%s sl=%s",
+            pair, effective_entry_price, sl_price,
+        )
+        return result
+
+    # ── 2c. Sanity check entry_price vs harga pasar live ──────────────────
+    # Menangkap kasus lain yang sl_wrong_side TIDAK selalu tangkap: entry
+    # kurang/lebih digit tapi kebetulan masih di sisi yang "benar" dari SL.
+    # Kalau entry_price (dari sinyal, bukan hasil estimasi ticker di atas —
+    # itu sudah pasti live) menyimpang > MAX_ENTRY_PRICE_DEVIATION_PERCENT
+    # dari harga pasar saat ini, kemungkinan besar salah baca, bukan limit
+    # order yang jauh dari market secara sengaja.
+    if not result.entry_price_estimated:
+        try:
+            live_price = await client.fetch_ticker_price(pair)
+            deviation_pct = abs(effective_entry_price - live_price) / live_price
+            if deviation_pct > settings.MAX_ENTRY_PRICE_DEVIATION_PERCENT:
+                result.failure_reason = "entry_price_deviation_too_large"
+                result.notes.append(
+                    f"Harga entry sinyal ({effective_entry_price:g}) menyimpang "
+                    f"{deviation_pct * 100:.1f}% dari harga pasar saat ini "
+                    f"({live_price:g}) — lebih dari batas "
+                    f"{settings.MAX_ENTRY_PRICE_DEVIATION_PERCENT * 100:.0f}%. "
+                    f"Kemungkinan besar salah baca angka entry dari sinyal "
+                    f"(kurang/lebih digit). Trade ditolak — cek ulang sinyal "
+                    f"asli kalau memang sengaja entry sejauh ini dari market."
+                )
+                logger.warning(
+                    "[risk_engine] entry_price_deviation_too_large untuk %s — "
+                    "entry=%s live=%s deviasi=%.1f%%",
+                    pair, effective_entry_price, live_price, deviation_pct * 100,
+                )
+                return result
+        except (CriticalError, TransientError) as exc:
+            # Sanity check gagal fetch bukan alasan buat block trade yang
+            # sudah lolos validasi lain — cukup dicatat sebagai note.
+            result.notes.append(
+                f"Sanity check harga entry vs live market dilewati "
+                f"(gagal fetch ticker: {exc})."
+            )
+            logger.warning(
+                "[risk_engine] Gagal fetch live price untuk sanity check %s: %s",
+                pair, exc,
+            )
 
     # ── 3. risk_amount sesuai mode aktif (bagian 4.1) ───────────────────
     try:
@@ -463,6 +576,9 @@ def format_risk_notification(result: RiskCalculationResult) -> str:
     if not result.success:
         reason_text = {
             "invalid_sl_distance": "Entry price = SL price (jarak nol) — sinyal tidak valid.",
+            "sl_distance_too_tight": "Jarak SL ke entry terlalu sempit — position size akan membengkak tidak wajar & tidak ada leverage yang bisa membuatnya aman dari liquidation.",
+            "sl_wrong_side": "SL berada di sisi yang salah dari entry untuk arah trade ini (kemungkinan salah baca harga).",
+            "entry_price_deviation_too_large": "Harga entry menyimpang terlalu jauh dari harga pasar live (kemungkinan salah baca harga).",
             "missing_entry_price": "Harga entry tidak tersedia untuk order limit.",
             "insufficient_margin": "Margin yang dibutuhkan lebih besar dari saldo tersedia.",
             "invalid_risk_config": "Konfigurasi risk (mode/persen/fixed USD) tidak valid.",

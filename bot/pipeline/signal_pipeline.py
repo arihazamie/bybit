@@ -262,10 +262,21 @@ class SignalPipeline:
             return msg
 
         # ── Cek circuit breaker ───────────────────────────────────────
+        # PENTING: parsing (evaluation.parsed) SUDAH SELESAI sebelum method
+        # ini dipanggil — _run_full_pipeline di bawah ini isinya risk_engine
+        # + leverage_engine + executor (order placement), BUKAN parsing.
+        # Makanya di-tag Component.ORDER_EXECUTION, konsisten dengan semua
+        # event_log di order_manager.py/open_position.py yang juga pakai
+        # ORDER_EXECUTION untuk error di tahap ini. Sebelumnya salah di-tag
+        # Component.SIGNAL_PARSER — akibatnya CriticalError dari executor
+        # (mis. "insufficient funds", "amount below minimum") ikut men-trip
+        # breaker SIGNAL_PARSER, yang lalu memblokir SEMUA sinyal baru
+        # (termasuk yang parsing-nya sukses & valid) sampai /resume manual —
+        # padahal parser-nya sendiri tidak pernah bermasalah.
         cb = self._cb
         try:
             await cb.execute_with_cb(
-                Component.SIGNAL_PARSER,
+                Component.ORDER_EXECUTION,
                 self._run_full_pipeline(parsed, pair, log_id, conflict_action),
             )
             return "✅ Pipeline selesai."
@@ -305,6 +316,7 @@ class SignalPipeline:
         # ── Risk engine (Step 9) ──────────────────────────────────────
         risk = await calculate_trade_risk(
             pair=pair,
+            direction=parsed.direction,
             entry_type=parsed.entry_type or EntryType.MARKET,
             entry_price=parsed.entry_price,
             sl_price=parsed.stop_loss or 0.0,
@@ -336,6 +348,48 @@ class SignalPipeline:
         # Kirim notif leverage adjustment jika terjadi
         if safety.leverage_adjusted or safety.even_min_leverage_unsafe:
             await notify(format_leverage_safety_notification(safety))
+
+        # even_min_leverage_unsafe == True berarti leverage_engine SUDAH
+        # membuktikan secara matematis: bahkan di leverage 1x, proyeksi
+        # liquidation tidak punya buffer aman ke SL — biasanya akibat
+        # position_size yang kebesaran (jarak SL terlalu sempit relatif ke
+        # entry_price, lihat risk_engine: position_size = risk_amount /
+        # sl_distance, SL sempit → position_size raksasa).
+        #
+        # Kalau FORCE_MAX_LEVERAGE AKTIF (default, keputusan user): leverage
+        # SENGAJA tidak diturunkan (tetap di max) — margin_needed jadi kecil
+        # di leverage tinggi, jadi TIDAK abort di sini, lanjut ke executor.
+        # max_loss tetap dijamin 1% oleh risk_engine SELAMA SL sempat fill;
+        # notif peringatan di atas sudah cukup untuk kasus ini.
+        #
+        # Kalau FORCE_MAX_LEVERAGE MATI: leverage_engine tetap memakai
+        # leverage minimum (1x) yang sudah terbukti tidak aman — posisi
+        # seukuran itu hampir pasti juga tidak lolos margin check exchange
+        # (insufficient funds). Daripada mencoba open_position dan gagal
+        # dengan pesan exchange yang membingungkan, pipeline berhenti DI SINI
+        # dengan alasan yang jelas.
+        if safety.even_min_leverage_unsafe and not settings.FORCE_MAX_LEVERAGE:
+            sl_note = (
+                f"Kemungkinan besar penyebabnya: jarak Stop Loss ke Entry TERLALU "
+                f"SEMPIT ({risk.sl_distance:g} dari entry {risk.entry_price_used:g} "
+                f"→ position_size jadi sangat besar untuk tetap risk 1%).\n\n"
+                f"<i>Sinyal tidak dieksekusi — cek ulang harga SL, atau perkecil "
+                f"risk per trade kalau SL memang sesempit ini.</i>"
+                if risk.sl_distance is not None and risk.entry_price_used is not None
+                else "<i>Sinyal tidak dieksekusi.</i>"
+            )
+            await notify(
+                f"🛑 <b>SINYAL {pair} DIBATALKAN</b>\n\n"
+                f"Leverage safety check sudah membuktikan posisi ini TIDAK bisa "
+                f"aman bahkan di leverage 1x (lihat detail di atas). {sl_note}"
+            )
+            logger.warning(
+                "[pipeline] %s dibatalkan — even_min_leverage_unsafe=True, "
+                "FORCE_MAX_LEVERAGE=False, position_size=%s tidak akan lolos "
+                "margin check di exchange.",
+                pair, risk.position_size,
+            )
+            return
 
         # ── Open position (Step 12) ───────────────────────────────────
         exec_result: ExecutionResult = await open_position(

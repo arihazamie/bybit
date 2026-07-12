@@ -11,6 +11,14 @@ dan profesional, untuk SEMUA cara sebuah trade bisa berakhir:
   - MANUAL      : ditutup manual oleh user (web/app Bitget) — baik posisi
                   open (close position) maupun limit entry yang masih
                   pending (cancel order)
+  - SL_AMENDED  : stop loss diubah levelnya (bukan closed) — biasanya user
+                  geser harga SL manual di web/app Bitget selagi posisi
+                  masih open. TIDAK menutup posisi, hanya update sl_price
+                  di database supaya tetap sinkron dengan exchange.
+  - SL_REMOVED  : order SL dibatalkan di exchange TANPA order SL pengganti
+                  (posisi jadi tanpa proteksi) — dikirim sebagai peringatan
+                  darurat, database TIDAK diubah (kolom sl_price NOT NULL,
+                  nilai lama disimpan hanya sebagai referensi terakhir).
 
 Cakupan (root cause yang difix di sini + exchange/bitget/ws_client.py):
 
@@ -46,6 +54,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
+from config.settings import settings
 from core.constants import CLOSE_PRICE_MATCH_TOLERANCE_PCT, CloseReason, TradeStatus
 from core.logging_setup import get_logger
 from db.crud.trades import (
@@ -55,12 +64,15 @@ from db.crud.trades import (
     async_get_open_trades,
     async_get_pending_trade_for_pair,
     async_get_pending_trades,
+    async_update_trade_sl,
     async_update_trade_status,
 )
 from exchange.bitget.retry import CriticalError, TransientError
 from exchange.bitget.rest_client import BitgetRestClient, get_rest_client
 from exchange.bitget.ws_client import OrderEvent, PositionEvent
 from notifications.notifier import notify
+
+from bot.executor.order_manager import set_stop_loss
 
 logger = get_logger(__name__)
 
@@ -87,6 +99,23 @@ def _pct_diff(a: Optional[float], b: Optional[float]) -> Optional[float]:
 
 # ── Order events ──────────────────────────────────────────────────────────
 
+def _is_stop_loss_order(event: OrderEvent) -> bool:
+    """
+    Heuristik untuk mengenali order SL (stop/trigger order) di antara semua
+    order event yang masuk: SL yang dipasang bot ini (lihat
+    order_manager.set_stop_loss) SELALU reduce_only=True DENGAN
+    trigger_price terisi (stop_market/stop order, params triggerPrice +
+    reduceOnly=True, side kebalikan posisi) — order entry biasa (limit/
+    market) tidak reduce_only dan tidak punya trigger_price.
+
+    Pola ini juga cocok untuk SL yang dipasang/diubah MANUAL di web/app
+    Bitget (trigger order Bitget Futures selalu berbentuk sama di ccxt
+    apapun asalnya) — makanya heuristik ini dipakai untuk mendeteksi SL
+    yang diubah/dibatalkan manual, bukan hanya SL bikinan bot.
+    """
+    return bool(event.reduce_only) and event.trigger_price is not None
+
+
 async def on_order_event(event: OrderEvent) -> None:
     """
     Dipanggil BitgetWsClient setiap ada update order — termasuk order yang
@@ -97,6 +126,16 @@ async def on_order_event(event: OrderEvent) -> None:
     status = (event.status or "").lower()
 
     try:
+        if _is_stop_loss_order(event):
+            # Order SL (reduce-only trigger order) — dicek terpisah dari
+            # order entry biasa, karena 'open' di sini bukan no-op seperti
+            # limit entry (SL 'open' = proteksi aktif, levelnya bisa
+            # berubah kapan saja lewat amend manual di web/app) dan
+            # 'cancelled' di sini bukan berarti sinyal dibatalkan, tapi
+            # posisi kehilangan proteksi.
+            await _handle_sl_order_event(event, status)
+            return
+
         if status in _CANCELLED_STATUSES:
             await _handle_order_cancelled(event)
         elif status in _FILLED_STATUSES:
@@ -156,12 +195,125 @@ async def _handle_order_filled(event: OrderEvent) -> None:
         "[order_sync] Trade #%s (%s) → OPEN (fill), order_id=%s source=%s",
         trade["id"], event.symbol, event.order_id or "-", event.source,
     )
+    # NB: SL TIDAK diset di sini lagi — sekarang dipasang LANGSUNG saat entry
+    # order dikirim (lihat signal_pipeline.py, dieksekusi bersamaan dengan
+    # entry, tidak menunggu fill event ini). Kalau di-set lagi di sini juga,
+    # hasilnya DOBEL SL order untuk trade yang sama. Handler ini sekarang
+    # murni update status + notifikasi informasi fill.
     await notify(
         f"✅ <b>LIMIT ORDER FILLED</b>\n\n"
         f"Pair    : <code>{event.symbol}</code>\n"
         f"Trade   : #{trade['id']}\n"
         f"Harga   : <code>{fill_price_display}</code>\n\n"
-        f"<i>Posisi sekarang berstatus OPEN.</i>"
+        f"<i>Posisi sekarang berstatus OPEN. SL sudah terpasang sejak entry "
+        f"dikirim — cek notifikasi \"SL TERPASANG\" sebelumnya.</i>"
+    )
+
+
+# ── SL order events (amend/cancel manual di web/app) ─────────────────────
+
+async def _handle_sl_order_event(event: OrderEvent, status: str) -> None:
+    """
+    Router untuk event order SL (reduce-only trigger order) — dipanggil dari
+    on_order_event ketika _is_stop_loss_order(event) True.
+
+    - status == 'open'        → SL masih aktif; levelnya dibandingkan dengan
+                                 sl_price di database — kalau beda berarti
+                                 diamend (mis. digeser manual di web/app),
+                                 sinkronkan database ke level terbaru.
+    - status in cancelled set → SL order hilang dari exchange TANPA order
+                                 pengganti yang terdeteksi bareng event ini —
+                                 posisi kehilangan proteksi, kirim peringatan.
+    - status == 'closed' (filled) → SL KENA (trigger tereksekusi). Ini sudah
+                                 tercover oleh on_position_event (contracts
+                                 jadi 0 → _handle_position_closed mengklasi-
+                                 fikasikannya sebagai SL_HIT lewat histori
+                                 order), jadi sengaja no-op di sini supaya
+                                 tidak dobel notifikasi.
+    """
+    if status == "open":
+        await _handle_sl_order_open(event)
+    elif status in _CANCELLED_STATUSES:
+        await _handle_sl_order_cancelled(event)
+    # status 'closed' (filled/triggered) — no-op, lihat docstring di atas.
+
+
+async def _handle_sl_order_open(event: OrderEvent) -> None:
+    """
+    SL order live dengan trigger_price tertentu — cross-check dengan
+    sl_price yang tersimpan di trade OPEN untuk pair ini. Kalau beda
+    (di luar toleransi CLOSE_PRICE_MATCH_TOLERANCE_PCT), berarti SL baru
+    saja diamend (paling sering: digeser manual di web/app Bitget) —
+    update database supaya tetap sinkron dengan exchange (source of truth).
+    """
+    if event.trigger_price is None:
+        return
+
+    trade = await async_get_open_trade_for_pair(event.symbol)
+    if trade is None:
+        return  # tidak ada trade OPEN lokal untuk pair ini — bukan SL yang kita lacak
+
+    current_sl = _f(trade.get("sl_price"))
+    diff_pct = _pct_diff(event.trigger_price, current_sl)
+    # NB: sama seperti _classify_close_reason — jangan pakai `diff or 999`,
+    # karena _pct_diff bisa return 0.0 (exact match) yang falsy di Python.
+    if diff_pct is not None and diff_pct <= CLOSE_PRICE_MATCH_TOLERANCE_PCT:
+        return  # sama dalam toleransi — tidak ada perubahan riil, no-op
+
+    ok = await async_update_trade_sl(trade["id"], event.trigger_price)
+    if not ok:
+        logger.warning(
+            "[order_sync] Gagal update SL trade #%s ke %s (pair=%s)",
+            trade["id"], event.trigger_price, event.symbol,
+        )
+        return
+
+    old_sl_display = f"{current_sl:g}" if current_sl is not None else "belum diset"
+    logger.info(
+        "[order_sync] Trade #%s (%s) → SL diupdate %s → %s, terdeteksi realtime "
+        "dari exchange (order_id=%s, source=%s)",
+        trade["id"], event.symbol, old_sl_display, event.trigger_price,
+        event.order_id or "-", event.source,
+    )
+    await notify(
+        f"🛡️ <b>STOP LOSS DIUBAH</b>\n\n"
+        f"Pair    : <code>{event.symbol}</code>\n"
+        f"Trade   : #{trade['id']}\n"
+        f"SL Lama : <code>{old_sl_display}</code>\n"
+        f"SL Baru : <code>{event.trigger_price:g}</code>\n\n"
+        f"<i>Terdeteksi realtime dari exchange — kemungkinan diubah manual di "
+        f"web/app Bitget. Database sudah disesuaikan ke level terbaru.</i>"
+    )
+
+
+async def _handle_sl_order_cancelled(event: OrderEvent) -> None:
+    """
+    SL order hilang (cancelled/expired) dari exchange untuk pair yang masih
+    punya trade OPEN di database. TIDAK menyentuh sl_price di database
+    (kolom NOT NULL, dan reconciliation berikutnya tidak boleh salah kira
+    "belum pernah ada SL" jadi 0/kosong) — nilai lama tetap tersimpan hanya
+    sebagai referensi historis. Ini murni peringatan darurat supaya user
+    sadar posisinya sekarang TANPA proteksi stop loss aktif di exchange.
+    """
+    trade = await async_get_open_trade_for_pair(event.symbol)
+    if trade is None:
+        return  # tidak ada trade OPEN lokal — no-op
+
+    last_sl = trade.get("sl_price")
+    logger.warning(
+        "[order_sync] Trade #%s (%s) → SL order DIBATALKAN di exchange "
+        "(order_id=%s, source=%s) — posisi SEKARANG TANPA proteksi stop "
+        "loss aktif! sl_price di database (%s) TIDAK diubah, hanya referensi terakhir.",
+        trade["id"], event.symbol, event.order_id or "-", event.source, last_sl,
+    )
+    await notify(
+        f"🚨 <b>PERINGATAN: STOP LOSS DIBATALKAN</b>\n\n"
+        f"Pair          : <code>{event.symbol}</code>\n"
+        f"Trade         : #{trade['id']}\n"
+        f"SL terakhir   : <code>{last_sl if last_sl is not None else '?'}</code>\n\n"
+        f"<i>Order SL terdeteksi dibatalkan di exchange — kemungkinan dihapus manual "
+        f"di web/app Bitget. Posisi ini SEKARANG TIDAK punya stop loss aktif. "
+        f"Segera pasang ulang SL kalau ini tidak disengaja.</i>"
     )
 
 

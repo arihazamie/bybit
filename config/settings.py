@@ -131,6 +131,38 @@ class Settings:
     # ── Leverage & Safety ───────────────────────────────────────────────
     LIQUIDATION_BUFFER_PERCENT: float = field(default=0.05) # 5%
 
+    # False (default) : leverage_engine boleh menurunkan leverage otomatis
+    #   demi buffer aman liquidation-vs-SL. INI YANG MENJAMIN SL sempat
+    #   ke-trigger SEBELUM liquidation — leverage tinggi = margin yang
+    #   dialokasikan ke posisi makin kecil = jarak ke liquidation makin
+    #   DEKAT (bukan makin jauh). Auto-reduce memilih leverage SETINGGI
+    #   MUNGKIN yang masih menyisakan buffer aman — bukan asal minimum,
+    #   jadi capital efficiency tetap terjaga di kasus normal.
+    # True : leverage SELALU dipakai di max_leverage_available (atau cap
+    #   manual /setleverage), tidak pernah diturunkan. HANYA aman dipakai
+    #   bersamaan dengan MIN_SL_DISTANCE_PERCENT yang cukup longgar,
+    #   karena kalau tidak, posisi dengan SL sempit bisa liquidated
+    #   sebelum SL sempat closing (rugi > risk_amount yang direncanakan).
+    FORCE_MAX_LEVERAGE: bool = field(default=False)
+
+    # Jarak minimum SL ke entry (dalam persen harga) yang masih dianggap
+    # valid untuk dieksekusi. Di bawah ini, position_size = risk_amount /
+    # sl_distance akan membengkak tidak wajar (lihat risk_engine.py) —
+    # sinyal ditolak SEBELUM sampai ke leverage_engine/exchange, dengan
+    # alasan jelas, bukan gagal membingungkan (insufficient funds / liq
+    # risk tersembunyi). 0.15% konservatif untuk BTC/ETH; sesuaikan naik
+    # untuk pair yang lebih volatile kalau perlu.
+    MIN_SL_DISTANCE_PERCENT: float = field(default=0.0015) # 0.15%
+
+    # Deviasi maksimum entry_price (dari sinyal) terhadap harga pasar live
+    # saat ini yang masih dianggap wajar. Menangkap kasus entry_price salah
+    # baca/kurang digit (mis. "6834" padahal maksudnya "68340") yang lolos
+    # dari validasi sl_wrong_side karena kebetulan masih di sisi yang benar
+    # — position_size akan salah total kalau dipaksakan. 0.15 = 15%,
+    # cukup longgar untuk limit order yang sengaja jauh dari market, tapi
+    # tetap menangkap kesalahan digit (biasanya >10x lipat = >900% deviasi).
+    MAX_ENTRY_PRICE_DEVIATION_PERCENT: float = field(default=0.15) # 15%
+
     # ── Logging ─────────────────────────────────────────────────────────
     LOG_LEVEL: str = field(default="INFO")
     LOG_DIR: str = field(default="logs")
@@ -243,6 +275,9 @@ def _load_settings() -> Settings:
 
         # Leverage & safety
         LIQUIDATION_BUFFER_PERCENT=_optional_float("LIQUIDATION_BUFFER_PERCENT", 0.05),
+        FORCE_MAX_LEVERAGE=_optional_bool("FORCE_MAX_LEVERAGE", False),
+        MIN_SL_DISTANCE_PERCENT=_optional_float("MIN_SL_DISTANCE_PERCENT", 0.0015),
+        MAX_ENTRY_PRICE_DEVIATION_PERCENT=_optional_float("MAX_ENTRY_PRICE_DEVIATION_PERCENT", 0.15),
 
         # Logging
         LOG_LEVEL=_optional("LOG_LEVEL", "INFO").upper(),

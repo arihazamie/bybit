@@ -87,6 +87,7 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
+from config.settings import settings
 from core.constants import Direction, EventType, Severity
 from core.logging_setup import get_logger
 from db.crud.event_log import async_log_event
@@ -723,7 +724,45 @@ async def run_leverage_safety_check(
     result.projection = proj_safe
     result.even_min_leverage_unsafe = even_min_unsafe
 
-    if even_min_unsafe:
+    # ── FORCE_MAX_LEVERAGE override ───────────────────────────────────
+    # Keputusan user: leverage SELALU dipakai di initial_leverage (max
+    # leverage_available atau cap manual /setleverage) — TIDAK PERNAH
+    # diturunkan otomatis, apapun hasil proyeksi liquidation-vs-SL.
+    # max_loss tetap dijamin 1% oleh risk_engine (position_size dari
+    # risk_amount/sl_distance, independen dari leverage) — trade-off yang
+    # disadari: kalau harga gap/slip melewati SL tanpa sempat fill,
+    # liquidation bisa lebih dulu terjadi dengan kerugian > 1%.
+    # proj_initial (dihitung di leverage awal, SEBELUM _find_safe_leverage
+    # mencoba menurunkannya) dipakai sebagai proyeksi yang ditampilkan,
+    # karena itulah leverage yang SEBENARNYA dipakai saat override aktif.
+    if settings.FORCE_MAX_LEVERAGE:
+        result.leverage_safe = initial_leverage
+        result.leverage_adjusted = False
+        result.projection = proj_initial
+
+    if even_min_unsafe and settings.FORCE_MAX_LEVERAGE:
+        msg = (
+            f"⚠️ Proyeksi liquidation untuk {pair} sangat dekat dengan SL bahkan "
+            f"di leverage minimum (1x) — total exposure akun kemungkinan sudah "
+            f"besar. FORCE_MAX_LEVERAGE aktif: leverage TETAP dipakai di "
+            f"{int(initial_leverage)}x sesuai konfigurasi (bukan diturunkan). "
+            f"max_loss tetap 1% by design SELAMA SL sempat fill — risiko gap/"
+            f"slip melewati SL tetap ada, PERIKSA exposure manual kalau perlu."
+        )
+        result.notes.append(msg)
+        logger.warning("[leverage_engine] %s", msg)
+
+        try:
+            await async_log_event(
+                event_type=EventType.LIQUIDATION_WARNING,
+                message=msg,
+                severity=Severity.CRITICAL,
+                component="leverage_engine",
+            )
+        except Exception as exc:
+            logger.warning("[leverage_engine] Gagal log event: %s", exc)
+
+    elif even_min_unsafe:
         msg = (
             f"⚠️ Bahkan leverage terendah (1x) tidak memberi buffer aman antara "
             f"proyeksi liquidation dan SL untuk {pair}. "
@@ -766,12 +805,13 @@ async def run_leverage_safety_check(
 
     logger.info(
         "[leverage_engine] %s | leverage_safe=%dx | liq=%.6f | sl=%.6f | "
-        "buffer=%.1f%% | adjusted=%s | even_min_unsafe=%s",
-        pair, int(leverage_safe),
-        proj_safe.liquidation_price, sl_price,
-        proj_safe.sl_to_liq_distance_pct * 100,
+        "buffer=%.1f%% | adjusted=%s | even_min_unsafe=%s | force_max_leverage=%s",
+        pair, int(result.leverage_safe),
+        result.projection.liquidation_price, sl_price,
+        result.projection.sl_to_liq_distance_pct * 100,
         result.leverage_adjusted,
         result.even_min_leverage_unsafe,
+        settings.FORCE_MAX_LEVERAGE,
     )
 
     return result
@@ -889,10 +929,21 @@ def format_leverage_safety_notification(result: LeverageSafetyResult) -> str:
 
     if result.even_min_leverage_unsafe:
         lines.append("🚨 PERINGATAN KRITIS — Leverage safety check:")
-        lines.append(
-            f"   Bahkan leverage 1x TIDAK memberi jarak aman dari liquidation."
-        )
-        lines.append("   Total exposure akun terlalu besar — pertimbangkan kurangi posisi!")
+        if settings.FORCE_MAX_LEVERAGE:
+            lines.append(
+                f"   Bahkan leverage minimum (1x) TIDAK memberi jarak aman dari "
+                f"liquidation — tapi FORCE_MAX_LEVERAGE aktif, leverage TETAP "
+                f"dipakai di {int(result.leverage_safe)}x (bukan diturunkan)."
+            )
+            lines.append(
+                "   max_loss tetap 1% SELAMA SL sempat fill — risiko gap/slip "
+                "melewati SL tetap ada."
+            )
+        else:
+            lines.append(
+                "   Bahkan leverage 1x TIDAK memberi jarak aman dari liquidation."
+            )
+            lines.append("   Total exposure akun terlalu besar — pertimbangkan kurangi posisi!")
     elif result.leverage_adjusted:
         lines.append("⚠️ Leverage otomatis diturunkan (safety check cross mode):")
         lines.append(
