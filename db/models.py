@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS trades (
     -- Harga
     entry_price                 REAL NOT NULL,
     sl_price                    REAL NOT NULL,
+    sl_order_id                 TEXT,           -- order id SL aktif di exchange (dipakai utk cancel saat /setsl update)
     tp_price                    REAL,           -- nullable; diisi manual oleh user
 
     -- Ukuran posisi & margin

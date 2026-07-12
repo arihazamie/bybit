@@ -19,8 +19,10 @@ from bot.executor.order_manager import (
     set_stop_loss,
     _opposite_side,
     _hold_side,
+    _humanize_exchange_error,
 )
 from core.constants import CloseReason, Direction
+import ccxt
 
 
 # ── Pure helpers ──────────────────────────────────────────────────────────────
@@ -131,13 +133,16 @@ async def test_set_stop_loss_dry_run():
 
 
 @pytest.mark.asyncio
-async def test_set_stop_loss_real_order_params_no_conflicting_keys():
+async def test_set_stop_loss_uses_position_scoped_tpsl_order():
     """
-    Regression test: create_order() sempat dipanggil dengan 'stopLossPrice'
-    DAN 'triggerPrice' di params sekaligus — ccxt bitget menolak ini dengan
-    'createOrder() params can only contain one of triggerPrice, stopLossPrice,
-    takeProfitPrice, trailingPercent', bikin SEMUA /setsl (dan SL otomatis
-    setelah entry) gagal dengan CriticalError. Fix: hanya kirim triggerPrice.
+    Regression test: SL sempat dipasang lewat params.triggerPrice (generic
+    standalone "plan order", endpoint place-plan-order) — order ini TIDAK
+    terikat ke posisi dan TIDAK pernah menggantikan order lama, jadi tiap
+    /setsl menumpuk order reduce-only baru di exchange sampai exchange
+    menolak order berikutnya dengan error generik yang membingungkan:
+        {"code":"400172","msg":"The order type is illegal"}
+    Fix: pakai params.stopLossPrice + holdSide (endpoint place-tpsl-order),
+    yaitu mekanisme resmi Bitget untuk SL yang terikat ke sebuah posisi.
     """
     trade = _mock_trade(direction="long", position_size=0.05)
 
@@ -167,8 +172,9 @@ async def test_set_stop_loss_real_order_params_no_conflicting_keys():
         f"params harus punya TEPAT SATU dari {exclusive_keys}, "
         f"tapi ditemukan: {present} (params={params})"
     )
-    assert params.get("triggerPrice") == 2900.0
-    assert "stopLossPrice" not in params
+    assert params.get("stopLossPrice") == 2900.0
+    assert "triggerPrice" not in params
+    assert params.get("holdSide") == "long"
 
 
 @pytest.mark.asyncio
@@ -180,8 +186,8 @@ async def test_set_stop_loss_uses_valid_bitget_order_type():
     'limit'. Kirim 'stop_market'/'stop' bikin SEMUA /setsl (manual maupun
     otomatis setelah entry fill) ditolak exchange dengan:
         {"code":"400172","msg":"The order type is illegal"}
-    Sifat trigger/stop-nya ditandai lewat params.triggerPrice (bukan lewat
-    nama order type) — fix: selalu kirim type='market'.
+    Sifat SL-nya ditandai lewat params.stopLossPrice (bukan lewat nama
+    order type) — fix: selalu kirim type='market'.
     """
     trade = _mock_trade(direction="long", position_size=0.05)
 
@@ -208,6 +214,89 @@ async def test_set_stop_loss_uses_valid_bitget_order_type():
         f"dapat: {call_kwargs.get('type')!r}. Kirim 'stop_market'/'stop' "
         f"akan ditolak exchange dengan code 400172 'The order type is illegal'."
     )
+
+
+@pytest.mark.asyncio
+async def test_set_stop_loss_cancels_old_order_before_placing_new():
+    """
+    Regression test: /setsl dipanggil berulang untuk trade yang sama tanpa
+    cancel SL order lama dulu → order reduce-only menumpuk di exchange dan
+    akhirnya ditolak. Fix: kalau trade.sl_order_id sudah ada, cancel dulu
+    (best-effort) sebelum memasang SL baru, lalu simpan order id yang baru.
+    """
+    trade = _mock_trade(direction="long", position_size=0.05)
+    trade["sl_order_id"] = "OLD_SL_123"
+
+    mock_exchange = AsyncMock()
+    mock_exchange.cancel_order = AsyncMock(return_value={})
+    mock_exchange.create_order = AsyncMock(return_value={"id": "NEW_SL_456"})
+    mock_client = MagicMock()
+    mock_client._get_exchange = AsyncMock(return_value=mock_exchange)
+
+    mock_update_sl = AsyncMock()
+
+    with (
+        patch("bot.executor.order_manager.async_get_trade_by_id", new_callable=AsyncMock, return_value=trade),
+        patch("bot.executor.order_manager.async_update_trade_sl", mock_update_sl),
+        patch("bot.executor.order_manager.async_log_event", new_callable=AsyncMock),
+    ):
+        result = await set_stop_loss(1, sl_price=2950.0, rest_client=mock_client, dry_run=False)
+
+    assert result.success, f"set_stop_loss gagal: {result.failure_reason}"
+
+    # SL lama harus di-cancel sebelum SL baru dipasang
+    mock_exchange.cancel_order.assert_called_once()
+    cancel_args, cancel_kwargs = mock_exchange.cancel_order.call_args
+    assert cancel_args[0] == "OLD_SL_123"
+    assert cancel_kwargs.get("params", {}).get("stop") is True
+
+    # SL order id baru harus disimpan ke DB
+    mock_update_sl.assert_called_once_with(1, 2950.0, "NEW_SL_456")
+
+
+@pytest.mark.asyncio
+async def test_set_stop_loss_old_order_missing_does_not_block_new_sl():
+    """
+    Kalau SL lama sudah tidak ada di exchange (OrderNotFound — misalnya
+    sudah fill atau expired), cancel dianggap beres dan SL baru tetap
+    dipasang seperti biasa (tidak boleh gagal total).
+    """
+    trade = _mock_trade(direction="long", position_size=0.05)
+    trade["sl_order_id"] = "GONE_SL"
+
+    mock_exchange = AsyncMock()
+    mock_exchange.cancel_order = AsyncMock(side_effect=ccxt.OrderNotFound("gone"))
+    mock_exchange.create_order = AsyncMock(return_value={"id": "NEW_SL_789"})
+    mock_client = MagicMock()
+    mock_client._get_exchange = AsyncMock(return_value=mock_exchange)
+
+    with (
+        patch("bot.executor.order_manager.async_get_trade_by_id", new_callable=AsyncMock, return_value=trade),
+        patch("bot.executor.order_manager.async_update_trade_sl", new_callable=AsyncMock),
+        patch("bot.executor.order_manager.async_log_event", new_callable=AsyncMock),
+    ):
+        result = await set_stop_loss(1, sl_price=2950.0, rest_client=mock_client, dry_run=False)
+
+    assert result.success, f"set_stop_loss seharusnya tetap sukses: {result.failure_reason}"
+    mock_exchange.create_order.assert_called_once()
+
+
+def test_humanize_exchange_error_400172_is_friendly():
+    exc = ccxt.InvalidOrder(
+        'bitget {"code":"400172","msg":"The order type is illegal","requestTime":1,"data":null}'
+    )
+    text = _humanize_exchange_error(exc)
+    assert "400172" not in text
+    assert "{" not in text
+    assert len(text) > 0
+
+
+def test_humanize_exchange_error_none_fallback():
+    text = _humanize_exchange_error(None)
+    assert isinstance(text, str) and len(text) > 0
+
+
+
 
 
 @pytest.mark.asyncio

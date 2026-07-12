@@ -25,36 +25,46 @@ Scope yang TIDAK dikerjakan di sini:
   - Watch order fill event (WS)     → Step 8 (ws_client) + Step 19 (pipeline)
 
 Catatan Bitget Futures — Stop Loss order:
-  Bitget Futures menyediakan "trigger order" (stop order) di endpoint
-  create_order — TAPI order type (field `orderType` di request Bitget)
-  HANYA boleh 'market' atau 'limit'. TIDAK ADA 'stop_market'/'stop' sebagai
-  order type — itu bug yang pernah ada di sini dan bikin SEMUA set_stop_loss
-  ditolak exchange dengan {"code":"400172","msg":"The order type is
-  illegal"}. Sifat trigger/stop-nya ditandai lewat keberadaan
-  params.triggerPrice (ccxt lalu otomatis set planType='normal_plan' di
-  request) — bukan lewat nama order type.
+  Bitget Futures punya DUA jenis order "trigger" yang gampang tertukar:
 
-  ccxt unified API mengekspos trigger order ini via create_order(...,
-  type='market', params={'triggerPrice': ...}) ATAU lewat
-  params={'stopLossPrice': ...} (preset SL yang nempel ke order lain,
-  dipakai open_position.py untuk limit entry) — TIDAK PERNAH keduanya
-  sekaligus. ccxt bitget createOrder() menolak params yang berisi lebih
-  dari satu dari triggerPrice/stopLossPrice/takeProfitPrice/
-  trailingPercent di saat bersamaan.
+  1. "Plan order" biasa (endpoint place-plan-order, ccxt: params.triggerPrice)
+     — order kondisional BERDIRI SENDIRI, tidak terikat ke posisi. Skema-nya
+     butuh 'side'+'tradeSide' (open/close) yang jelas, dan setiap panggilan
+     create_order() dengan triggerPrice akan membuat order BARU — tidak
+     pernah menggantikan order lama. Kalau dipakai berulang untuk SL (mis.
+     tiap kali /setsl dipanggil), order reduce-only akan MENUMPUK di
+     exchange untuk symbol yang sama, dan cepat atau lambat exchange
+     menolak order berikutnya (parameter/posisi tidak konsisten) — muncul
+     sebagai error generik {"code":"400172","msg":"The order type is
+     illegal"} yang membingungkan karena sebenarnya bukan soal `orderType`.
+  2. "TPSL order" (endpoint place-tpsl-order, ccxt: params.stopLossPrice)
+     — order yang TERIKAT ke posisi (holdSide 'long'/'short'), inilah
+     mekanisme resmi Bitget untuk stop loss sebuah posisi. Skemanya HANYA
+     butuh triggerPrice + holdSide + size, tidak butuh side/tradeSide/
+     reduceOnly/marginMode sama sekali.
 
-  Implementasi menggunakan create_order type='market' + params.triggerPrice
-  (market close ketika harga trigger tercapai) dengan params Bitget:
-    - 'triggerPrice' : harga trigger SL (SATU-SATUNYA dari keempat opsi di
-                        atas yang boleh dipakai di sini)
-    - 'side'          : kebalikan posisi (LONG → 'sell', SHORT → 'buy')
-    - 'reduceOnly'    : True — HANYA close posisi existing, tidak buka baru
+  Implementasi di bawah ini SENGAJA pakai jalur (2) — params.stopLossPrice,
+  BUKAN params.triggerPrice — supaya SL benar-benar terikat ke posisi dan
+  konsisten dengan cara Bitget sendiri menampilkan/menghitungnya. Order
+  type (field `orderType` Bitget) tetap HARUS 'market' atau 'limit' — TIDAK
+  PERNAH 'stop_market'/'stop' (itu bug lama yang sudah dibuang duluan).
+
+  ccxt bitget createOrder() menolak params yang berisi lebih dari satu dari
+  triggerPrice/stopLossPrice/takeProfitPrice/trailingPercent sekaligus —
+  jadi params di sini HANYA berisi 'stopLossPrice'.
+
+  Params yang dikirim ke create_order(type='market', params=...):
+    - 'stopLossPrice' : harga trigger SL (SATU-SATUNYA dari keempat opsi
+                         exclusive yang dipakai di sini)
     - 'holdSide'      : 'long' | 'short' — arah posisi yang di-protect
-    - 'marginMode'    : 'cross'
+    - 'triggerType'   : 'mark_price' (default Bitget, eksplisit di sini)
     - 'productType'   : 'USDT-FUTURES'
 
-  Jika endpoint ini tidak tersedia / ditolak exchange, fallback ke trigger
-  order dengan params triggerPrice + closePosition=True (order type tetap
-  'market', bukan 'stop').
+  Karena TPSL order TIDAK auto-replace saat dipanggil ulang (order lama
+  tetap ada di exchange kalau tidak di-cancel), set_stop_loss() di bawah
+  selalu MENCOBA cancel sl_order_id lama (tersimpan di DB, kolom
+  trades.sl_order_id) SEBELUM memasang SL baru — supaya /setsl benar-benar
+  "update", bukan menambah order baru yang menumpuk.
 """
 
 from __future__ import annotations
@@ -166,15 +176,15 @@ async def _place_sl_order(
     dry_run: bool,
 ) -> Dict[str, Any]:
     """
-    Kirim stop order ke Bitget Futures.
+    Kirim SL order (TPSL, terikat ke posisi) ke Bitget Futures.
 
     Dry-run: return stub tanpa menyentuh exchange.
     Raise CriticalError / TransientError ke caller.
     """
     if dry_run:
         logger.info(
-            "[order_manager][DRY-RUN] Would place SL stop order: "
-            "%s %s triggerPrice=%g size=%g",
+            "[order_manager][DRY-RUN] Would place SL TPSL order: "
+            "%s %s stopLossPrice=%g size=%g",
             symbol, _hold_side(direction), sl_price, position_size,
         )
         return {"id": "DRY_RUN_SL", "symbol": symbol}
@@ -185,25 +195,10 @@ async def _place_sl_order(
     try:
         exchange = await client._get_exchange()
 
-        # Bitget Futures: stop order = order type LIMIT/MARKET biasa + params
-        # triggerPrice (BUKAN 'stop_market'/'stop' sebagai order type!).
-        #
-        # BUG SEBELUMNYA (fix ini): kode lama kirim type="stop_market" ke
-        # exchange.create_order(). ccxt bitget forward string `type` itu
-        # APA ADANYA ke field `orderType` di request Bitget — dan Bitget
-        # HANYA menerima orderType='market' atau 'limit', TIDAK PERNAH
-        # 'stop_market'/'stop'. Sifat "trigger/stop"-nya ditandai lewat
-        # keberadaan params.triggerPrice (ccxt lalu otomatis set
-        # planType='normal_plan' di request), bukan lewat nama order type.
-        # Akibatnya SEMUA panggilan set_stop_loss (baik dari pipeline
-        # otomatis maupun command /setsl manual) selalu ditolak exchange:
-        #   {"code":"400172","msg":"The order type is illegal"}
-        #
-        # PENTING: ccxt bitget createOrder() cuma boleh SATU dari
-        # triggerPrice/stopLossPrice/takeProfitPrice/trailingPercent di params
-        # — kirim dua-duanya (stopLossPrice + triggerPrice) ditolak exchange.
-        # Kita pakai triggerPrice saja (trigger/stop order berdiri sendiri,
-        # bukan SL yang nempel ke posisi lewat stopLossPrice).
+        # params.stopLossPrice → ccxt bitget route ke endpoint place-tpsl-order
+        # (SL yang TERIKAT ke posisi via holdSide) — BUKAN params.triggerPrice
+        # yang route ke place-plan-order (order kondisional berdiri sendiri).
+        # Lihat penjelasan lengkap di docstring modul ini.
         raw = await exchange.create_order(
             symbol=symbol,
             type="market",
@@ -211,48 +206,17 @@ async def _place_sl_order(
             amount=position_size,
             price=None,
             params={
-                "triggerPrice": sl_price,
-                "reduceOnly": True,
+                "stopLossPrice": sl_price,
                 "holdSide": hold_side,
-                "marginMode": "cross",
+                "triggerType": "mark_price",
                 "productType": "USDT-FUTURES",
             },
         )
         logger.info(
-            "[order_manager] SL order placed: %s trigger=%g → id=%s",
+            "[order_manager] SL TPSL order placed: %s trigger=%g → id=%s",
             symbol, sl_price, _parse_order_id(raw),
         )
         return raw
-
-    except ccxt.NotSupported:
-        # Fallback: trigger order dengan closePosition (order type tetap
-        # 'market' — closePosition/holdSide yang membedakan varian, BUKAN
-        # nama order type; lihat penjelasan di atas).
-        try:
-            raw = await exchange.create_order(
-                symbol=symbol,
-                type="market",
-                side=side,
-                amount=position_size,
-                price=None,
-                params={
-                    "triggerPrice": sl_price,
-                    "closePosition": True,
-                    "holdSide": hold_side,
-                    "marginMode": "cross",
-                    "productType": "USDT-FUTURES",
-                },
-            )
-            logger.info(
-                "[order_manager] SL order placed (fallback stop): %s trigger=%g → id=%s",
-                symbol, sl_price, _parse_order_id(raw),
-            )
-            return raw
-        except Exception as exc2:
-            raise CriticalError(
-                f"[order_manager] Fallback SL order juga gagal untuk {symbol}: {exc2}",
-                original=exc2,
-            ) from exc2
 
     except (CriticalError, TransientError):
         raise
@@ -287,6 +251,90 @@ async def _place_sl_order(
             f"[order_manager] Unexpected error saat set SL {symbol}: {exc}",
             original=exc,
         ) from exc
+
+
+async def _cancel_sl_order(
+    client: BitgetRestClient,
+    symbol: str,
+    sl_order_id: str,
+    dry_run: bool,
+) -> None:
+    """
+    Cancel SL TPSL order lama di exchange (best-effort, dipanggil sebelum
+    memasang SL baru supaya /setsl benar-benar "update" bukan menambah
+    order baru yang menumpuk).
+
+    OrderNotFound (SL lama sudah fill/ke-cancel/expired) dianggap sukses.
+    Error lain di-log sebagai warning dan TIDAK menghentikan proses —
+    kegagalan cancel order lama tidak boleh memblokir pemasangan SL baru.
+    """
+    if dry_run:
+        logger.info(
+            "[order_manager][DRY-RUN] Would cancel old SL order %s for %s",
+            sl_order_id, symbol,
+        )
+        return
+    try:
+        exchange = await client._get_exchange()
+        await exchange.cancel_order(
+            sl_order_id, symbol,
+            params={
+                "stop": True,
+                "planType": "pos_loss",
+                "productType": "USDT-FUTURES",
+            },
+        )
+        logger.info(
+            "[order_manager] Old SL order cancelled: %s id=%s", symbol, sl_order_id
+        )
+    except ccxt.OrderNotFound:
+        logger.info(
+            "[order_manager] Old SL order %s untuk %s tidak ditemukan "
+            "(sudah fill/cancel/expired) — dianggap beres.",
+            sl_order_id, symbol,
+        )
+    except Exception as exc:
+        logger.warning(
+            "[order_manager] Gagal cancel SL order lama %s untuk %s (non-fatal, "
+            "lanjut pasang SL baru): %s",
+            sl_order_id, symbol, exc,
+        )
+
+
+def _humanize_exchange_error(exc: Optional[BaseException]) -> str:
+    """
+    Terjemahkan exception teknis dari ccxt/exchange jadi pesan singkat yang
+    enak dibaca di Telegram. Detail teknis lengkap tetap masuk ke log &
+    event_log lewat CriticalError/TransientError.__str__ — fungsi ini HANYA
+    untuk teks yang ditampilkan ke user.
+    """
+    if exc is None:
+        return "Terjadi kesalahan tidak diketahui saat menghubungi exchange."
+
+    text = str(exc)
+
+    if isinstance(exc, ccxt.AuthenticationError):
+        return "Gagal autentikasi ke exchange — cek API key/secret/passphrase bot."
+    if isinstance(exc, ccxt.InsufficientFunds):
+        return "Saldo margin di exchange tidak cukup untuk operasi ini."
+    if isinstance(exc, ccxt.InvalidOrder):
+        if "400172" in text:
+            return (
+                "Exchange menolak order ini (parameter/order tidak valid). "
+                "Biasanya karena masih ada order SL lama yang belum bersih di "
+                "exchange — tunggu sebentar lalu coba /setsl lagi. Jika terus "
+                "terjadi, cek order pending di exchange secara manual."
+            )
+        return "Order ditolak exchange — parameter order tidak valid untuk posisi/pair ini."
+    if isinstance(exc, ccxt.RateLimitExceeded):
+        return "Exchange sedang membatasi request (rate limit) — tunggu sebentar lalu coba lagi."
+    if isinstance(exc, ccxt.RequestTimeout):
+        return "Exchange tidak merespons tepat waktu (timeout) — coba lagi."
+    if isinstance(exc, ccxt.NetworkError):
+        return "Gangguan koneksi ke exchange — coba lagi dalam beberapa saat."
+    if isinstance(exc, ccxt.ExchangeError):
+        return "Exchange menolak permintaan ini. Cek log bot untuk detail teknis."
+    return "Terjadi kesalahan tak terduga saat menghubungi exchange. Cek log bot untuk detail teknis."
 
 
 async def set_stop_loss(
@@ -331,12 +379,20 @@ async def set_stop_loss(
     pair = trade["pair"]
     direction = trade.get("direction", Direction.LONG)
     position_size = _safe_float(trade.get("position_size"))
+    old_sl_order_id = trade.get("sl_order_id")
 
     if position_size <= 0:
         return OrderManagementResult(
             success=False, operation="set_sl", pair=pair, trade_id=trade_id,
             failure_reason="invalid_position_size: position_size=0", is_critical=False,
         )
+
+    # Cancel SL order lama (kalau ada) SEBELUM pasang yang baru, supaya
+    # /setsl benar-benar "update" — bukan menambah order baru yang
+    # menumpuk di exchange. Best-effort: kegagalan cancel tidak
+    # menghentikan pemasangan SL baru (lihat _cancel_sl_order).
+    if old_sl_order_id:
+        await _cancel_sl_order(client, pair, old_sl_order_id, is_dry)
 
     # Place stop order
     try:
@@ -350,7 +406,7 @@ async def set_stop_loss(
         )
         return OrderManagementResult(
             success=False, operation="set_sl", pair=pair, trade_id=trade_id,
-            failure_reason=f"critical: {exc}", is_critical=True,
+            failure_reason=_humanize_exchange_error(exc.original or exc), is_critical=True,
         )
     except TransientError as exc:
         msg = f"Transient error saat set SL {pair} @ {sl_price}: {exc}"
@@ -361,14 +417,14 @@ async def set_stop_loss(
         )
         return OrderManagementResult(
             success=False, operation="set_sl", pair=pair, trade_id=trade_id,
-            failure_reason=f"transient: {exc}", is_critical=False,
+            failure_reason=_humanize_exchange_error(exc.original or exc), is_critical=False,
         )
 
     sl_order_id = _parse_order_id(raw)
 
-    # Update DB
+    # Update DB (harga + order id baru, supaya /setsl berikutnya bisa cancel ini)
     try:
-        await async_update_trade_sl(trade_id, sl_price)
+        await async_update_trade_sl(trade_id, sl_price, sl_order_id or None)
     except Exception as exc:
         logger.warning("[order_manager] DB update SL gagal (non-fatal): %s", exc)
 
@@ -517,7 +573,7 @@ async def cancel_pending_order(
         )
         return OrderManagementResult(
             success=False, operation="cancel_order", pair=pair, trade_id=trade_id,
-            failure_reason=f"critical: {exc}", is_critical=True,
+            failure_reason=_humanize_exchange_error(exc.original or exc), is_critical=True,
         )
     except TransientError as exc:
         msg = f"Transient error saat cancel order {pair}: {exc}"
@@ -528,7 +584,7 @@ async def cancel_pending_order(
         )
         return OrderManagementResult(
             success=False, operation="cancel_order", pair=pair, trade_id=trade_id,
-            failure_reason=f"transient: {exc}", is_critical=False,
+            failure_reason=_humanize_exchange_error(exc.original or exc), is_critical=False,
         )
 
     # Update DB
@@ -679,7 +735,7 @@ async def close_position(
         )
         return OrderManagementResult(
             success=False, operation="close_position", pair=pair, trade_id=trade_id,
-            failure_reason=f"critical: {exc}", is_critical=True,
+            failure_reason=_humanize_exchange_error(exc.original or exc), is_critical=True,
         )
     except TransientError as exc:
         msg = f"Transient error saat close posisi {pair}: {exc}"
@@ -690,7 +746,7 @@ async def close_position(
         )
         return OrderManagementResult(
             success=False, operation="close_position", pair=pair, trade_id=trade_id,
-            failure_reason=f"transient: {exc}", is_critical=False,
+            failure_reason=_humanize_exchange_error(exc.original or exc), is_critical=False,
         )
 
     # Estimasi PnL dari raw close order (tidak selalu tersedia)

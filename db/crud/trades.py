@@ -272,13 +272,31 @@ def cancel_trade(trade_id: int) -> bool:
     return updated
 
 
-def update_trade_sl(trade_id: int, new_sl_price: float) -> bool:
-    """Update Stop Loss harga untuk trade yang sedang open."""
+def update_trade_sl(
+    trade_id: int,
+    new_sl_price: float,
+    sl_order_id: Optional[str] = None,
+) -> bool:
+    """
+    Update Stop Loss harga untuk trade yang sedang open.
+
+    sl_order_id: opsional — id order SL yang baru dipasang di exchange.
+    Disimpan supaya panggilan /setsl berikutnya bisa cancel order lama
+    sebelum memasang yang baru (mencegah order SL menumpuk di exchange).
+    Jika None, kolom sl_order_id tidak diubah (dipertahankan apa adanya).
+    """
     with get_db() as conn:
-        cur = conn.execute(
-            "UPDATE trades SET sl_price = ? WHERE id = ? AND status = 'open'",
-            (new_sl_price, trade_id),
-        )
+        if sl_order_id is not None:
+            cur = conn.execute(
+                "UPDATE trades SET sl_price = ?, sl_order_id = ? "
+                "WHERE id = ? AND status = 'open'",
+                (new_sl_price, sl_order_id, trade_id),
+            )
+        else:
+            cur = conn.execute(
+                "UPDATE trades SET sl_price = ? WHERE id = ? AND status = 'open'",
+                (new_sl_price, trade_id),
+            )
         updated = cur.rowcount > 0
 
     if updated:
@@ -525,8 +543,12 @@ async def async_close_trade(
     )
 
 
-async def async_update_trade_sl(trade_id: int, new_sl_price: float) -> bool:
-    return await _run_in_executor(update_trade_sl, trade_id, new_sl_price)
+async def async_update_trade_sl(
+    trade_id: int,
+    new_sl_price: float,
+    sl_order_id: Optional[str] = None,
+) -> bool:
+    return await _run_in_executor(update_trade_sl, trade_id, new_sl_price, sl_order_id)
 
 
 async def async_update_trade_tp(trade_id: int, new_tp_price: float) -> bool:

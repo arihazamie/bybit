@@ -167,6 +167,10 @@ def init_db(db_path: Optional[str | Path] = None) -> None:
             conn.execute(stmt)
         logger.debug("All tables created/verified")
 
+        # 1b. Migrasi ringan untuk DB lama (CREATE TABLE IF NOT EXISTS tidak
+        # menambah kolom baru ke tabel yang sudah ada sebelumnya).
+        _migrate_add_missing_columns(conn)
+
         # 2. Buat semua trigger
         for trigger in ALL_TRIGGERS:
             conn.execute(trigger)
@@ -179,6 +183,26 @@ def init_db(db_path: Optional[str | Path] = None) -> None:
         _seed_circuit_breaker(conn)
 
     logger.info("Database initialization complete")
+
+
+def _migrate_add_missing_columns(conn: sqlite3.Connection) -> None:
+    """
+    Tambahkan kolom baru ke tabel yang sudah ada (untuk DB lama yang dibuat
+    sebelum kolom tsb ada di models.py). Aman dipanggil berulang kali —
+    cek dulu via PRAGMA table_info sebelum ALTER TABLE.
+    """
+    migrations = {
+        "trades": {
+            "sl_order_id": "TEXT",
+        },
+    }
+
+    for table, columns in migrations.items():
+        existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        for column, col_type in columns.items():
+            if column not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
+                logger.info(f"Migrated: added column '{column}' to table '{table}'")
 
 
 def _seed_default_settings(conn: sqlite3.Connection) -> None:
