@@ -315,11 +315,15 @@ async def test_pause_already_paused():
 async def test_resume_when_paused():
     from bot.control_bot.commands.position import cmd_resume
     update, ctx = _make_update(), _make_context()
+    mock_cb = MagicMock()
+    mock_cb.resume = AsyncMock(return_value=[])
     with patch(AUTH_PATCH, return_value=ALLOWED_IDS), \
          patch("bot.control_bot.commands.position.is_bot_paused", return_value=True), \
-         patch("bot.control_bot.commands.position.set_bot_paused") as mock_resume:
+         patch("bot.control_bot.commands.position.set_bot_paused") as mock_resume, \
+         patch("bot.control_bot.commands.position.get_circuit_breaker", return_value=mock_cb):
         await cmd_resume(update, ctx)
     mock_resume.assert_called_once_with(False)
+    mock_cb.resume.assert_awaited_once()
     text = update.message.reply_text.call_args[0][0]
     assert "AKTIF" in text
 
@@ -328,11 +332,38 @@ async def test_resume_when_paused():
 async def test_resume_already_running():
     from bot.control_bot.commands.position import cmd_resume
     update, ctx = _make_update(), _make_context()
+    mock_cb = MagicMock()
+    mock_cb.resume = AsyncMock(return_value=[])
     with patch(AUTH_PATCH, return_value=ALLOWED_IDS), \
-         patch("bot.control_bot.commands.position.is_bot_paused", return_value=False):
+         patch("bot.control_bot.commands.position.is_bot_paused", return_value=False), \
+         patch("bot.control_bot.commands.position.get_circuit_breaker", return_value=mock_cb):
         await cmd_resume(update, ctx)
+    mock_cb.resume.assert_awaited_once()
     text = update.message.reply_text.call_args[0][0]
     assert "AKTIF" in text
+    assert "Tidak ada circuit breaker" in text
+
+
+@pytest.mark.asyncio
+async def test_resume_also_transitions_open_circuit_breaker():
+    """
+    Regresi: /resume WAJIB juga meng-HALF_OPEN-kan circuit breaker yang
+    trip, bukan cuma toggle is_bot_paused — sebelumnya command ini tidak
+    pernah menyentuh circuit breaker sama sekali, jadi user yang CB-nya
+    OPEN tetap terblokir eksekusi walau sudah kirim /resume.
+    """
+    from bot.control_bot.commands.position import cmd_resume
+    update, ctx = _make_update(), _make_context()
+    mock_cb = MagicMock()
+    mock_cb.resume = AsyncMock(return_value=["order_execution"])
+    with patch(AUTH_PATCH, return_value=ALLOWED_IDS), \
+         patch("bot.control_bot.commands.position.is_bot_paused", return_value=False), \
+         patch("bot.control_bot.commands.position.get_circuit_breaker", return_value=mock_cb):
+        await cmd_resume(update, ctx)
+    mock_cb.resume.assert_awaited_once_with()
+    text = update.message.reply_text.call_args[0][0]
+    assert "order_execution" in text
+    assert "HALF_OPEN" in text
 
 
 # ── Callback handler ──────────────────────────────────────────────────────────

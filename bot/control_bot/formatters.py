@@ -38,11 +38,71 @@ def _pnl(val: Optional[float]) -> str:
     return f"{sign}{val:.2f} USDT"
 
 
+def _pnl_pct(val: Optional[float]) -> str:
+    if val is None:
+        return "—"
+    sign = "+" if val >= 0 else ""
+    return f"{sign}{val:.2f}%"
+
+
+def _price(val: Optional[float]) -> str:
+    if val is None:
+        return "—"
+    return f"{val:.6g}"
+
+
 def _r(val: Optional[float]) -> str:
     if val is None:
         return ""
     sign = "+" if val >= 0 else ""
     return f" ({sign}{val:.1f}R)"
+
+
+def _extract_live_pnl(
+    live: Optional[dict],
+    entry_price: Optional[float],
+    position_size: Optional[float],
+    margin_used: Optional[float],
+    direction: str,
+) -> tuple[Optional[float], Optional[float], Optional[float]]:
+    """
+    Ambil (current_price, pnl_usd, pnl_pct) dari data posisi live exchange (raw
+    ccxt position dict — hasil `fetch_positions`).
+
+    Prioritas:
+      1. Pakai field unrealized PnL & percentage langsung dari exchange (paling
+         akurat, sudah memperhitungkan cara hitung Bitget sendiri).
+      2. Kalau field itu kosong tapi markPrice/last tersedia, hitung manual
+         dari entry_price & position_size sebagai fallback supaya angka tetap
+         tampil walau response ccxt tidak lengkap.
+    """
+    if not live:
+        return None, None, None
+
+    current_price = live.get("markPrice") or live.get("last") or live.get("lastPrice")
+    pnl_usd = live.get("unrealizedPnl")
+    if pnl_usd is None:
+        pnl_usd = live.get("unrealizedPnlAmount")
+    pnl_pct = live.get("percentage")
+
+    if current_price is not None:
+        current_price = float(current_price)
+
+    if pnl_usd is None and current_price is not None and entry_price and position_size:
+        diff = current_price - entry_price
+        if direction == "short":
+            diff = -diff
+        pnl_usd = diff * position_size
+
+    if pnl_usd is not None:
+        pnl_usd = float(pnl_usd)
+
+    if pnl_pct is None and pnl_usd is not None and margin_used:
+        pnl_pct = (pnl_usd / margin_used) * 100
+    if pnl_pct is not None:
+        pnl_pct = float(pnl_pct)
+
+    return current_price, pnl_usd, pnl_pct
 
 
 def fmt_dashboard(
@@ -93,17 +153,29 @@ def fmt_dashboard(
     return "\n".join(lines)
 
 
-def fmt_positions(trades: list[dict]) -> str:
+def fmt_positions(trades: list[dict], live_positions: Optional[dict] = None) -> str:
+    """
+    Format daftar posisi open/pending.
+
+    live_positions: dict opsional {symbol -> raw ccxt position dict} hasil
+    `fetch_positions()` live dari exchange. Kalau tersedia (hanya berlaku
+    untuk posisi status 'open'), tiap posisi ditampilkan lengkap dengan harga
+    sekarang, floating P/L dalam USDT, dan P/L dalam persen — supaya laporan
+    /positions setara dashboard exchange, bukan cuma data statis dari DB.
+    """
     if not trades:
         return "Tidak ada posisi open atau pending saat ini."
 
+    live_positions = live_positions or {}
     lines = [f"<b>📋 Posisi ({len(trades)})</b>"]
 
     for i, t in enumerate(trades, 1):
-        direction_icon = "🟢" if t["direction"] == "long" else "🔴"
+        direction = t["direction"]
+        direction_icon = "🟢" if direction == "long" else "🔴"
         status_label = "⏳ pending" if t["status"] == "pending" else "✅ open"
         lev = f"{t['leverage_used']:.0f}x" if t.get("leverage_used") else "—"
-        margin = f"{t['margin_used']:.2f} USDT" if t.get("margin_used") else "—"
+        margin_used = t.get("margin_used")
+        margin = f"{margin_used:.2f} USDT" if margin_used else "—"
         tp = f"{t['tp_price']:.6g}" if t.get("tp_price") else "—"
         opened = _local(t.get("opened_at") or t.get("created_at"))
 
@@ -113,8 +185,28 @@ def fmt_positions(trades: list[dict]) -> str:
             f"   Entry  : <code>{t['entry_price']:.6g}</code>  |  SL: <code>{t['sl_price']:.6g}</code>  |  TP: <code>{tp}</code>",
             f"   Size   : <code>{t['position_size']:.6g}</code>  |  Lev: {lev}  |  Margin: <code>{margin}</code>",
             f"   Risk   : <code>{t['risk_amount_usd']:.2f} USDT</code> ({t['risk_mode']})",
-            f"   Masuk  : {opened}",
         ]
+
+        if t["status"] == "open":
+            live = live_positions.get(t["pair"])
+            current_price, pnl_usd, pnl_pct = _extract_live_pnl(
+                live,
+                entry_price=t.get("entry_price"),
+                position_size=t.get("position_size"),
+                margin_used=margin_used,
+                direction=direction,
+            )
+            pnl_icon = "📈" if (pnl_usd or 0) >= 0 else "📉"
+            lines.append(
+                f"   Harga  : <code>{_price(current_price)}</code>  |  "
+                f"P/L: {pnl_icon} <code>{_pnl(pnl_usd)}</code> "
+                f"(<code>{_pnl_pct(pnl_pct)}</code>)"
+            )
+            if live is None:
+                lines.append("   ⚠️ Data live exchange tidak tersedia — P/L belum terupdate")
+
+        lines.append(f"   Masuk  : {opened}")
+
         if t.get("leverage_auto_adjusted"):
             lines.append("   ⚠️ Leverage diturunkan otomatis (safety SL)")
 

@@ -75,6 +75,80 @@ def test_positions_format():
     assert "20x" in text
 
 
+def _base_open_trade(**overrides) -> dict:
+    trade = {
+        "pair": "ETH/USDT:USDT",
+        "direction": "long",
+        "status": "open",
+        "entry_price": 3200.0,
+        "sl_price": 3100.0,
+        "tp_price": 3400.0,
+        "position_size": 0.1,
+        "leverage_used": 20.0,
+        "margin_used": 16.0,
+        "risk_amount_usd": 10.0,
+        "risk_mode": "percent",
+        "leverage_auto_adjusted": False,
+        "opened_at": "2025-01-01T10:00:00",
+        "created_at": "2025-01-01T09:59:00",
+    }
+    trade.update(overrides)
+    return trade
+
+
+def test_positions_with_live_data_shows_price_and_pnl():
+    """Posisi open dengan data live exchange harus tampil harga sekarang,
+    P/L dalam USDT, dan P/L dalam persen — bukan cuma data statis DB."""
+    trades = [_base_open_trade()]
+    live_positions = {
+        "ETH/USDT:USDT": {
+            "symbol": "ETH/USDT:USDT",
+            "markPrice": 3320.5,
+            "unrealizedPnl": 12.05,
+            "percentage": 75.3,
+            "contracts": 0.1,
+        }
+    }
+    text = fmt_positions(trades, live_positions)
+    assert "3320.5" in text
+    assert "+12.05 USDT" in text
+    assert "+75.30%" in text
+
+
+def test_positions_live_pnl_fallback_calculation():
+    """Kalau ccxt tidak mengirim unrealizedPnl/percentage tapi markPrice ada,
+    P/L dihitung manual dari entry_price & position_size sebagai fallback."""
+    trades = [_base_open_trade(direction="short", entry_price=3200.0, margin_used=16.0)]
+    live_positions = {
+        "ETH/USDT:USDT": {
+            "symbol": "ETH/USDT:USDT",
+            "markPrice": 3100.0,
+            "contracts": 0.1,
+        }
+    }
+    text = fmt_positions(trades, live_positions)
+    # short: (3200 - 3100) * 0.1 = +10.00 USDT
+    assert "+10.00 USDT" in text
+    assert "3100" in text
+
+
+def test_positions_without_live_data_shows_warning():
+    """Kalau posisi open tidak ketemu di live_positions (mis. exchange gagal
+    diakses), tetap tampil tapi dengan placeholder + warning, bukan error."""
+    trades = [_base_open_trade()]
+    text = fmt_positions(trades, {})
+    assert "Data live exchange tidak tersedia" in text
+
+
+def test_positions_pending_trade_has_no_pnl_section():
+    """Trade berstatus pending belum punya posisi di exchange, jadi tidak
+    perlu baris harga/P&L sama sekali."""
+    trades = [_base_open_trade(status="pending", opened_at=None)]
+    text = fmt_positions(trades, {})
+    assert "Harga" not in text
+    assert "P/L" not in text
+
+
 # ── fmt_history ───────────────────────────────────────────────────────────────
 
 def test_history_empty():

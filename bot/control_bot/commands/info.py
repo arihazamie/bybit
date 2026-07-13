@@ -76,6 +76,30 @@ async def _fetch_balance():
         return None
 
 
+async def _fetch_live_positions() -> dict:
+    """
+    Ambil posisi live (REST) dari exchange untuk keperluan /positions —
+    dipetakan {symbol: raw ccxt position dict} supaya formatter bisa
+    menampilkan harga sekarang, floating P/L ($), dan P/L (%) yang akurat
+    langsung dari Bitget, bukan sekadar data statis dari DB.
+
+    Return dict kosong (bukan raise) kalau gagal — /positions tetap harus
+    tampil walau exchange sedang tidak bisa diakses, hanya tanpa data live.
+    """
+    try:
+        from exchange.bitget.rest_client import BitgetRestClient
+        async with BitgetRestClient() as client:
+            positions = await client.fetch_positions()
+        return {
+            p["symbol"]: p
+            for p in positions
+            if p.get("symbol") and (p.get("contracts") or 0) != 0
+        }
+    except Exception as exc:
+        logger.warning(f"fetch_positions gagal di /positions: {exc}")
+        return {}
+
+
 async def _send(update: Update, text: str) -> None:
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
@@ -94,7 +118,8 @@ async def cmd_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _reconcile_before_read()
     trades = await async_get_open_trades()
-    await _send(update, fmt_positions(trades))
+    live_positions = await _fetch_live_positions()
+    await _send(update, fmt_positions(trades, live_positions))
 
 
 @authorized

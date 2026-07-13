@@ -17,10 +17,20 @@ Stop Loss:
     reduceOnly stop_market order (Step 13, order_manager.set_stop_loss).
   - LIMIT order: belum fill saat order dikirim, jadi TIDAK bisa pakai
     reduceOnly (butuh posisi yang sudah ada). SL untuk limit order WAJIB
-    di-attach atomically ke order entry itu sendiri lewat
-    params.stopLossPrice (preset SL Bitget, aktif otomatis begitu limit
+    di-attach atomically ke order entry itu sendiri lewat parameter unified
+    ccxt `stopLoss={"triggerPrice": ...}` (di-map ke `presetStopLossPrice`
+    Bitget — preset SL yang nempel ke order INI, aktif otomatis begitu limit
     order fill). sl_price WAJIB ada untuk limit order — kalau kosong,
     open_position() menolak sebelum order dikirim ke exchange.
+
+    PENTING — jangan pakai params.stopLossPrice (tanpa "preset") di sini:
+    ccxt.bitget menafsirkan stopLossPrice sebagai *stop-loss TRIGGER order*
+    (planType=pos_loss) yang butuh posisi yang SUDAH ADA di exchange untuk
+    di-attach via holdSide — order limit entry yang belum fill tidak punya
+    posisi sama sekali, jadi request itu selalu ditolak Bitget dengan error
+    43011 "holdSide error". `stopLoss={"triggerPrice": ...}` adalah jalur
+    yang benar: ccxt me-map ke `presetStopLossPrice`, preset SL yang
+    ditempel ke order entry itu sendiri (tidak butuh holdSide/posisi).
 
 Scope yang TIDAK dikerjakan di sini:
   - Cancel pending order / close posisi → Step 13
@@ -123,14 +133,6 @@ def _ccxt_side(direction: str) -> str:
     return "buy" if direction == Direction.LONG else "sell"
 
 
-def _hold_side(direction: str) -> str:
-    """
-    'long' | 'short' — dibutuhkan Bitget untuk params.holdSide saat attach
-    preset SL (stopLossPrice) ke order entry. Sama seperti order_manager._hold_side.
-    """
-    return "long" if direction == Direction.LONG else "short"
-
-
 def _to_int_leverage(leverage: float) -> int:
     """Floor leverage ke integer — ccxt.bitget butuh integer."""
     return max(1, math.floor(leverage))
@@ -205,10 +207,11 @@ async def _place_order(
     """
     Kirim order ke Bitget Futures via ccxt.
 
-    LIMIT order: sl_price WAJIB (>0) — di-attach ke request lewat
-    params.stopLossPrice supaya SL aktif otomatis begitu order fill
-    (posisi belum ada saat order dikirim, jadi reduceOnly stop order
-    terpisah tidak bisa dipakai di sini — lihat docstring modul).
+    LIMIT order: sl_price WAJIB (>0) — di-attach ke request lewat parameter
+    unified `stopLoss` (preset SL, bukan trigger order terpisah) supaya SL
+    aktif otomatis begitu order fill (posisi belum ada saat order dikirim,
+    jadi reduceOnly stop order terpisah tidak bisa dipakai di sini — lihat
+    docstring modul).
 
     Dry-run: return stub dict tanpa menyentuh exchange.
     Raise CriticalError / TransientError ke caller.
@@ -257,18 +260,21 @@ async def _place_order(
                     "parser/risk engine seharusnya sudah menangkap ini.",
                 )
             # sl_price sudah divalidasi wajib ada di atas (guard sebelum dry_run).
-            # stopLossPrice = preset SL Bitget — nempel ke order INI, aktif
-            # otomatis begitu limit order fill. Ini SATU-SATUNYA dari
-            # triggerPrice/stopLossPrice/takeProfitPrice/trailingPercent yang
-            # dikirim (lihat catatan di order_manager.py — kirim >1 sekaligus
-            # ditolak exchange).
+            # `stopLoss={"triggerPrice": ...}` (unified ccxt) = preset SL Bitget
+            # (presetStopLossPrice) — nempel ke order INI, aktif otomatis begitu
+            # limit order fill, TANPA butuh posisi yang sudah ada.
+            #
+            # JANGAN pakai params.stopLossPrice (tanpa "preset") — ccxt.bitget
+            # menafsirkannya sebagai stop-loss TRIGGER order (planType=pos_loss)
+            # yang butuh holdSide + posisi yang SUDAH ADA di exchange. Order
+            # limit entry yang belum fill tidak punya posisi, jadi request itu
+            # selalu ditolak Bitget: error 43011 "holdSide error".
             raw = await exchange.create_limit_order(
                 symbol, side, position_size, entry_price,
                 params={
                     "marginMode": "cross",
                     "productType": "USDT-FUTURES",
-                    "stopLossPrice": sl_price,
-                    "holdSide": _hold_side(direction),
+                    "stopLoss": {"triggerPrice": sl_price},
                 },
             )
 

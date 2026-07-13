@@ -21,6 +21,7 @@ from telegram.ext import ContextTypes
 
 from bot.control_bot.auth import authorized
 from bot.control_bot.inline.pending_store import make_pending_key, pending_store
+from bot.circuit_breaker.manager import get_circuit_breaker
 from bot.executor.order_manager import (
     cancel_pending_order,
     close_all_positions,
@@ -443,17 +444,41 @@ async def cmd_pause(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 @authorized
 async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_bot_paused():
-        await _send(update, "ℹ️ Bot sedang <b>AKTIF</b> — tidak dalam mode pause.")
-        return
-    set_bot_paused(False)
-    logger.info("Bot di-resume via /resume command")
-    await _send(
-        update,
-        "▶️ <b>Bot AKTIF kembali</b>\n\n"
-        "Bot akan eksekusi sinyal baru sesuai setting.\n\n"
-        "Cek status: <code>/status</code> | <code>/settings</code>"
-    )
+    """
+    /resume harus mengembalikan bot ke kondisi bisa eksekusi sinyal lagi
+    secara PENUH — bukan cuma un-pause. Kalau circuit breaker sedang OPEN
+    (mis. abis trip gara-gara error beruntun di order_execution), eksekusi
+    TETAP diblokir oleh CB walau bot_paused sudah False. Jadi /resume di sini
+    juga wajib panggil cb.resume() (OPEN → HALF_OPEN) — sebelumnya command
+    ini cuma toggle is_bot_paused dan tidak pernah menyentuh circuit breaker
+    sama sekali, jadi user yang CB-nya OPEN tetap stuck walau sudah /resume.
+    """
+    was_paused = is_bot_paused()
+    if was_paused:
+        set_bot_paused(False)
+        logger.info("Bot di-resume via /resume command")
+
+    cb = get_circuit_breaker()
+    transitioned = await cb.resume()
+
+    lines = []
+    if was_paused:
+        lines.append("▶️ <b>Bot AKTIF kembali</b> (keluar dari mode PAUSE).")
+    else:
+        lines.append("ℹ️ Bot sudah AKTIF (tidak dalam mode pause).")
+
+    if transitioned:
+        comp_list = ", ".join(f"<code>{c}</code>" for c in transitioned)
+        lines.append(
+            f"\n🟡 Circuit breaker di-resume ke <b>HALF_OPEN</b>: {comp_list}\n"
+            "Eksekusi berikutnya jadi probe — kalau sukses otomatis balik CLOSED, "
+            "kalau gagal balik OPEN lagi (dan /resume harus dikirim ulang)."
+        )
+    elif not was_paused:
+        lines.append("\nTidak ada circuit breaker yang sedang OPEN.")
+
+    lines.append("\nCek status: <code>/status</code> | <code>/settings</code>")
+    await _send(update, "\n".join(lines))
 
 
 # ── Callback query handler ────────────────────────────────────────────────────

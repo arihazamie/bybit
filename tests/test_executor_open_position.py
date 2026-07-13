@@ -280,3 +280,47 @@ async def test_open_position_leverage_adjusted_note():
     assert result.leverage_adjusted
     assert result.leverage_used == 10.0
     assert any("Leverage diturunkan" in n for n in result.notes)
+
+
+# ── Regresi bug 43011 "holdSide error" (limit entry + preset SL) ────────────
+#
+# Root cause: ccxt.bitget menafsirkan params.stopLossPrice sebagai stop-loss
+# TRIGGER order (planType=pos_loss) yang butuh posisi yang SUDAH ADA di
+# exchange untuk di-attach via holdSide. Order limit entry yang belum fill
+# tidak punya posisi sama sekali → request selalu ditolak Bitget dengan
+# error 43011. Fix: pakai parameter unified `stopLoss={"triggerPrice": ...}`
+# yang di-map ccxt ke `presetStopLossPrice` — preset SL yang nempel ke order
+# entry itu sendiri, tidak butuh holdSide/posisi.
+
+@pytest.mark.asyncio
+async def test_place_order_limit_uses_preset_stoploss_not_trigger_order():
+    from bot.executor.open_position import _place_order
+
+    fake_raw_order = {"id": "123", "symbol": "LTC/USDT:USDT", "side": "buy", "price": 42.8}
+    mock_exchange = MagicMock()
+    mock_exchange.create_limit_order = AsyncMock(return_value=fake_raw_order)
+
+    mock_client = MagicMock()
+    mock_client._get_exchange = AsyncMock(return_value=mock_exchange)
+
+    await _place_order(
+        client=mock_client,
+        symbol="LTC/USDT:USDT",
+        direction=Direction.LONG,
+        entry_type=EntryType.LIMIT,
+        position_size=7.68233259,
+        entry_price=42.8,
+        sl_price=41.5,
+        dry_run=False,
+    )
+
+    mock_exchange.create_limit_order.assert_awaited_once()
+    _, kwargs = mock_exchange.create_limit_order.call_args
+    params = kwargs.get("params") or mock_exchange.create_limit_order.call_args[0][-1]
+
+    # Parameter yang MENYEBABKAN error 43011 tidak boleh pernah dikirim lagi.
+    assert "stopLossPrice" not in params
+    assert "holdSide" not in params
+
+    # Parameter yang benar: preset SL via unified `stopLoss`.
+    assert params.get("stopLoss") == {"triggerPrice": 41.5}
