@@ -51,11 +51,17 @@ Batasan desain (karena tabel `trades` tidak menyimpan order_id exchange):
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from config.settings import settings
-from core.constants import CLOSE_PRICE_MATCH_TOLERANCE_PCT, CloseReason, TradeStatus
+from core.constants import (
+    CLOSE_PRICE_MATCH_TOLERANCE_PCT,
+    ORDER_CANCEL_AMEND_GRACE_SECONDS,
+    CloseReason,
+    TradeStatus,
+)
 from core.logging_setup import get_logger
 from db.crud.trades import (
     async_cancel_trade,
@@ -64,6 +70,7 @@ from db.crud.trades import (
     async_get_open_trades,
     async_get_pending_trade_for_pair,
     async_get_pending_trades,
+    async_update_trade_entry,
     async_update_trade_sl,
     async_update_trade_status,
 )
@@ -95,6 +102,49 @@ def _pct_diff(a: Optional[float], b: Optional[float]) -> Optional[float]:
     if a is None or b is None or b == 0:
         return None
     return abs(a - b) / abs(b) * 100.0
+
+
+async def _find_replacement_order(
+    symbol: str,
+    exclude_order_id: str,
+    *,
+    reduce_only: bool,
+) -> Optional[Dict[str, Any]]:
+    """
+    Cek ke exchange (REST) apakah masih ada order LIVE untuk `symbol` selain
+    `exclude_order_id` (order yang baru saja dapat event cancelled) dengan
+    tipe yang sesuai (`reduce_only=True` untuk SL/trigger, `False` untuk
+    entry limit biasa).
+
+    Dipakai untuk membedakan CANCEL SUNGGUHAN vs AMEND (Bitget tidak punya
+    "edit order" in-place untuk limit/trigger order biasa — geser harga
+    manual di web/app = cancel order lama + create order baru di baliknya).
+    Kalau order pengganti ketemu → ini amend, bukan cancel beneran.
+
+    Return raw ccxt order dict kalau ketemu, None kalau tidak (berarti
+    cancel-nya nyata).
+    """
+    try:
+        rest = get_rest_client()
+        open_orders = await rest.fetch_open_orders(symbol)
+    except (CriticalError, TransientError) as exc:
+        logger.warning(
+            "[order_sync] Gagal cek ulang open orders %s untuk deteksi amend "
+            "(anggap cancel beneran): %s", symbol, exc,
+        )
+        return None
+
+    for raw in open_orders:
+        order_id = str(raw.get("id") or (raw.get("info") or {}).get("orderId") or "")
+        if order_id == exclude_order_id:
+            continue  # order yang sama (belum ke-drop dari snapshot), skip
+        info = raw.get("info") or {}
+        is_reduce_only = bool(raw.get("reduceOnly") or info.get("reduceOnly"))
+        has_trigger = _f(raw.get("triggerPrice") or raw.get("stopPrice") or info.get("triggerPrice")) is not None
+        order_is_sl_like = is_reduce_only and has_trigger
+        if order_is_sl_like == reduce_only:
+            return raw
+    return None
 
 
 # ── Order events ──────────────────────────────────────────────────────────
@@ -153,6 +203,20 @@ async def _handle_order_cancelled(event: OrderEvent) -> None:
     if trade is None:
         return  # tidak ada trade PENDING lokal untuk pair ini — no-op
 
+    # ── Cek dulu: cancel beneran atau cuma AMEND (geser harga entry)? ──
+    # Bitget tidak punya "edit order" in-place untuk limit order biasa —
+    # user geser harga entry limit manual di web/app = cancel order lama +
+    # create order baru (order_id beda) di baliknya. Tunggu grace period
+    # singkat supaya order pengganti (kalau ada) sempat muncul di snapshot
+    # exchange, baru vonis cancel/amend.
+    await asyncio.sleep(ORDER_CANCEL_AMEND_GRACE_SECONDS)
+    replacement = await _find_replacement_order(
+        event.symbol, event.order_id, reduce_only=False,
+    )
+    if replacement is not None:
+        await _handle_entry_price_amended(trade, event, replacement)
+        return
+
     ok = await async_cancel_trade(trade["id"])
     if not ok:
         logger.warning(
@@ -173,6 +237,57 @@ async def _handle_order_cancelled(event: OrderEvent) -> None:
         f"Entry   : <code>{trade.get('entry_price', '?')}</code>\n\n"
         f"<i>Terdeteksi realtime dari exchange — kemungkinan dibatalkan manual "
         f"di web/app Bitget. Status database sudah disesuaikan ke CANCELLED.</i>"
+    )
+
+
+async def _handle_entry_price_amended(
+    trade: dict, event: OrderEvent, replacement: Dict[str, Any],
+) -> None:
+    """
+    Order entry limit lama dibatalkan TAPI ada order pengganti live untuk
+    pair yang sama — ini amend (harga entry digeser manual di web/app),
+    bukan cancel sungguhan. Sinkronkan entry_price di database ke harga
+    order pengganti tsb, trade TETAP berstatus pending (tidak dibatalkan).
+    """
+    new_price = _f(replacement.get("price"))
+    old_price = _f(trade.get("entry_price"))
+
+    if new_price is None:
+        logger.warning(
+            "[order_sync] Trade #%s (%s) — order pengganti ketemu tapi harga "
+            "tidak terbaca, skip update (trade tetap PENDING apa adanya).",
+            trade["id"], event.symbol,
+        )
+        return
+
+    diff_pct = _pct_diff(new_price, old_price)
+    if diff_pct is not None and diff_pct <= CLOSE_PRICE_MATCH_TOLERANCE_PCT:
+        return  # harga sama dalam toleransi — no-op
+
+    ok = await async_update_trade_entry(trade["id"], new_price)
+    if not ok:
+        logger.warning(
+            "[order_sync] Gagal update entry trade #%s ke %s (pair=%s)",
+            trade["id"], new_price, event.symbol,
+        )
+        return
+
+    old_price_display = f"{old_price:g}" if old_price is not None else "?"
+    logger.info(
+        "[order_sync] Trade #%s (%s) → entry diamend %s → %s (bukan cancel "
+        "beneran, order lama order_id=%s digantikan order baru order_id=%s)",
+        trade["id"], event.symbol, old_price_display, new_price,
+        event.order_id or "-", replacement.get("id") or "-",
+    )
+    await notify(
+        f"✏️ <b>LIMIT ENTRY DIUBAH</b>\n\n"
+        f"Pair       : <code>{event.symbol}</code>\n"
+        f"Trade      : #{trade['id']}\n"
+        f"Entry Lama : <code>{old_price_display}</code>\n"
+        f"Entry Baru : <code>{new_price:g}</code>\n\n"
+        f"<i>Terdeteksi realtime dari exchange — harga entry limit diubah manual "
+        f"di web/app Bitget (bukan dibatalkan). Database sudah disesuaikan ke "
+        f"harga terbaru, trade tetap PENDING.</i>"
     )
 
 
@@ -286,6 +401,53 @@ async def _handle_sl_order_open(event: OrderEvent) -> None:
     )
 
 
+async def _handle_sl_price_amended_via_replacement(
+    trade: dict, event: OrderEvent, replacement: Dict[str, Any],
+) -> None:
+    """
+    SL order lama dapat event cancelled TAPI ada order trigger pengganti
+    live untuk pair yang sama — ini amend (SL digeser manual di web/app
+    lewat cancel+create, bukan in-place), bukan proteksi hilang sungguhan.
+    Sinkronkan sl_price di database ke trigger price order pengganti.
+    """
+    info = replacement.get("info") or {}
+    new_trigger = _f(
+        replacement.get("triggerPrice") or replacement.get("stopPrice") or info.get("triggerPrice")
+    )
+    if new_trigger is None:
+        return
+
+    current_sl = _f(trade.get("sl_price"))
+    diff_pct = _pct_diff(new_trigger, current_sl)
+    if diff_pct is not None and diff_pct <= CLOSE_PRICE_MATCH_TOLERANCE_PCT:
+        return  # sama dalam toleransi — no-op
+
+    ok = await async_update_trade_sl(trade["id"], new_trigger)
+    if not ok:
+        logger.warning(
+            "[order_sync] Gagal update SL trade #%s ke %s (pair=%s) via deteksi amend",
+            trade["id"], new_trigger, event.symbol,
+        )
+        return
+
+    old_sl_display = f"{current_sl:g}" if current_sl is not None else "belum diset"
+    logger.info(
+        "[order_sync] Trade #%s (%s) → SL diamend %s → %s (bukan dibatalkan "
+        "beneran, order lama order_id=%s digantikan order baru order_id=%s)",
+        trade["id"], event.symbol, old_sl_display, new_trigger,
+        event.order_id or "-", replacement.get("id") or "-",
+    )
+    await notify(
+        f"🛡️ <b>STOP LOSS DIUBAH</b>\n\n"
+        f"Pair    : <code>{event.symbol}</code>\n"
+        f"Trade   : #{trade['id']}\n"
+        f"SL Lama : <code>{old_sl_display}</code>\n"
+        f"SL Baru : <code>{new_trigger:g}</code>\n\n"
+        f"<i>Terdeteksi realtime dari exchange — kemungkinan diubah manual di "
+        f"web/app Bitget. Database sudah disesuaikan ke level terbaru.</i>"
+    )
+
+
 async def _handle_sl_order_cancelled(event: OrderEvent) -> None:
     """
     SL order hilang (cancelled/expired) dari exchange untuk pair yang masih
@@ -294,10 +456,30 @@ async def _handle_sl_order_cancelled(event: OrderEvent) -> None:
     "belum pernah ada SL" jadi 0/kosong) — nilai lama tetap tersimpan hanya
     sebagai referensi historis. Ini murni peringatan darurat supaya user
     sadar posisinya sekarang TANPA proteksi stop loss aktif di exchange.
+
+    TAPI: kalau ini cuma AMEND (SL digeser manual di web/app), Bitget bisa
+    saja cancel order trigger lama + create order trigger baru (order_id
+    beda) di baliknya, bukan cuma update in-place — jadi jangan langsung
+    kirim peringatan "tanpa proteksi", cek dulu apakah ada order SL
+    pengganti yang live untuk pair ini.
     """
     trade = await async_get_open_trade_for_pair(event.symbol)
     if trade is None:
         return  # tidak ada trade OPEN lokal — no-op
+
+    await asyncio.sleep(ORDER_CANCEL_AMEND_GRACE_SECONDS)
+    replacement = await _find_replacement_order(
+        event.symbol, event.order_id, reduce_only=True,
+    )
+    if replacement is not None:
+        await _handle_sl_price_amended_via_replacement(trade, event, replacement)
+        return
+
+    # Re-fetch trade — mungkin sudah disinkronkan oleh event 'open' dari SL
+    # pengganti yang diproses lebih dulu (_handle_sl_order_open) sebelum
+    # grace period ini selesai; kalau begitu, tidak ada apa-apa untuk
+    # diperingatkan lagi.
+    trade = await async_get_open_trade_for_pair(event.symbol) or trade
 
     last_sl = trade.get("sl_price")
     logger.warning(

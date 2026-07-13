@@ -143,6 +143,22 @@ RETRY_BACKOFF_SECONDS = (2, 5, 15)   # percobaan ke-1, ke-2, ke-3
 # tersimpan di database saat menentukan close_reason (sl_hit/tp_hit/liquidated).
 CLOSE_PRICE_MATCH_TOLERANCE_PCT = 0.35
 
+# ── Cancel vs amend grace period (detik) ─────────────────────────────────
+# Bitget TIDAK punya "amend in-place" untuk order limit/trigger biasa —
+# saat user menggeser harga entry limit ATAU trigger price SL manual di
+# web/app, exchange-nya melakukan CANCEL order lama + CREATE order baru
+# (order_id beda) di baliknya. Tanpa penanganan khusus, event 'cancelled'
+# untuk order lama itu langsung dibaca sebagai "order dibatalkan sungguhan"
+# oleh order_sync.py — padahal cuma perubahan harga (amend), bukan cancel.
+#
+# Fix: begitu event cancelled untuk order entry/SL pending diterima, jangan
+# langsung vonis CANCELLED — tunggu grace period singkat ini dulu supaya
+# event 'open' dari order pengganti (kalau ini memang amend) sempat masuk,
+# lalu re-check live open orders via REST. Kalau order pengganti ketemu →
+# ini amend (update harga di database). Kalau tidak → baru vonis cancelled/
+# tanpa proteksi sungguhan.
+ORDER_CANCEL_AMEND_GRACE_SECONDS = 2.5
+
 # ── Inline button timeout (menit) ──────────────────────────────────────
 INLINE_BUTTON_TIMEOUT_MINUTES = 10   # setelah ini → auto-abaikan sinyal ambigu
 
