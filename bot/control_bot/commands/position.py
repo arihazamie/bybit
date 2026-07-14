@@ -48,7 +48,7 @@ logger = get_logger(__name__)
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-async def _reconcile_before_action() -> None:
+async def _reconcile_before_action() -> bool:
     """
     Cross-check DB open/pending trades vs posisi & order LIVE di exchange
     SEBELUM command ini melihat/mengubah sebuah trade. Tanpa ini, /settp,
@@ -57,17 +57,23 @@ async def _reconcile_before_action() -> None:
     — hasilnya membingungkan (order gagal aneh) atau, lebih parah, keputusan
     diambil berdasarkan data posisi yang sudah tidak ada.
 
-    Dibungkus timeout supaya command TIDAK PERNAH hang menunggu exchange —
-    kalau reconcile lambat/gagal, command tetap lanjut pakai data DB terakhir
-    (fail-open, dengan log warning) daripada macet total.
+    Dibungkus timeout supaya command TIDAK PERNAH hang menunggu exchange.
+    Kalau reconcile lambat/gagal, return False — caller WAJIB hentikan aksi
+    dan kabari user, bukan diam-diam lanjut pakai data DB basi.
     """
     try:
         from bot.executor.order_sync import reconcile_on_startup
         await asyncio.wait_for(reconcile_on_startup(), timeout=8.0)
+        return True
     except asyncio.TimeoutError:
-        logger.warning("[position] Live reconciliation timeout (>8s) sebelum aksi — lanjut pakai data DB terakhir.")
-    except Exception as exc:  # noqa: BLE001 — command tetap lanjut, DB lama dipakai sbg fallback
+        logger.warning("[position] Live reconciliation timeout (>8s) sebelum aksi — aksi dihentikan.")
+        return False
+    except Exception as exc:  # noqa: BLE001 — aksi dihentikan, jangan fail-open
         logger.warning(f"[position] Live reconciliation gagal sebelum aksi: {exc}")
+        return False
+
+
+_RECONCILE_FAIL_MSG = "❌ Gagal verifikasi ke exchange, coba lagi."
 
 
 async def _send(update: Update, text: str, reply_markup=None):
@@ -189,7 +195,9 @@ async def cmd_settp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await _send(update, "❌ Harga harus lebih dari 0.")
         return
 
-    await _reconcile_before_action()
+    if not await _reconcile_before_action():
+        await _send(update, _RECONCILE_FAIL_MSG)
+        return
     trade = await async_get_filled_open_trade_for_pair(pair)
     if not trade:
         pending = await async_get_pending_trade_for_pair(pair)
@@ -246,7 +254,9 @@ async def cmd_setsl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await _send(update, "❌ Harga harus lebih dari 0.")
         return
 
-    await _reconcile_before_action()
+    if not await _reconcile_before_action():
+        await _send(update, _RECONCILE_FAIL_MSG)
+        return
     trade = await async_get_filled_open_trade_for_pair(pair)
     if not trade:
         pending = await async_get_pending_trade_for_pair(pair)
@@ -302,7 +312,9 @@ async def cmd_setentry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await _send(update, "❌ Harga harus lebih dari 0.")
         return
 
-    await _reconcile_before_action()
+    if not await _reconcile_before_action():
+        await _send(update, _RECONCILE_FAIL_MSG)
+        return
     trade = await async_get_pending_trade_for_pair(pair)
     if not trade:
         await _send(update, f"❌ Tidak ada order <b>PENDING</b> untuk <code>{pair}</code>.")
@@ -336,7 +348,9 @@ async def cmd_close(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     pair  = context.args[0].upper()
-    await _reconcile_before_action()
+    if not await _reconcile_before_action():
+        await _send(update, _RECONCILE_FAIL_MSG)
+        return
     trade = await async_get_filled_open_trade_for_pair(pair)
     if not trade:
         pending = await async_get_pending_trade_for_pair(pair)
@@ -373,7 +387,9 @@ async def cmd_close(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 @authorized
 async def cmd_closeall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _reconcile_before_action()
+    if not await _reconcile_before_action():
+        await _send(update, _RECONCILE_FAIL_MSG)
+        return
     open_trades = await async_get_filled_open_trades()
     if not open_trades:
         await _send(update, "ℹ️ Tidak ada posisi open saat ini.")
@@ -396,6 +412,9 @@ async def cmd_closeall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 @authorized
 async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _reconcile_before_action():
+        await _send(update, _RECONCILE_FAIL_MSG)
+        return
     pending = await async_get_pending_trades()
     if not pending:
         await _send(update, "ℹ️ Tidak ada pending order saat ini.")
@@ -428,6 +447,9 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     pair  = context.args[0].upper()
+    if not await _reconcile_before_action():
+        await _send(update, _RECONCILE_FAIL_MSG)
+        return
     trade = await async_get_pending_trade_for_pair(pair)
     if not trade:
         await _send(update, f"❌ Tidak ada order <b>PENDING</b> untuk <code>{pair}</code>.")

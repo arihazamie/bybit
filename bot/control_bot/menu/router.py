@@ -37,6 +37,7 @@ from bot.control_bot.commands.risk import (
     cmd_setleverage, cmd_setmaxloss, cmd_setrisk,
 )
 from bot.control_bot.commands.position import (
+    _reconcile_before_action,
     cmd_cancel, cmd_close, cmd_closeall, cmd_pause, cmd_pending,
     cmd_resume, cmd_setentry, cmd_setsl, cmd_settp,
 )
@@ -116,6 +117,14 @@ async def _cancel_prompt_kb(return_to: str) -> InlineKeyboardMarkup:
 
 
 async def _prompt_pair_pick(update: Update, action: str) -> None:
+    query = update.callback_query
+    if not await _reconcile_before_action():
+        await query.edit_message_text(
+            "❌ Gagal verifikasi ke exchange, coba lagi.",
+            reply_markup=await _cancel_prompt_kb("menu:pos"),
+        )
+        return
+
     source, _, _ = _PAIR_PICK_ACTIONS[action]
     if source == "open_only":
         trades = await async_get_filled_open_trades()
@@ -125,7 +134,6 @@ async def _prompt_pair_pick(update: Update, action: str) -> None:
         trades = await async_get_pending_trades()
     pairs = sorted({t["pair"] for t in trades})
 
-    query = update.callback_query
     if not pairs:
         label = "posisi open" if source in ("open", "open_only") else "order pending"
         await query.edit_message_text(

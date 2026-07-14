@@ -169,6 +169,42 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
         return default
 
 
+async def _fetch_live_position_or_none(
+    client: BitgetRestClient, pair: str
+) -> Optional[Dict[str, Any]]:
+    """
+    Fetch posisi LIVE (REST, fetch_positions([pair])) TEPAT SEBELUM place
+    order — dipakai set_stop_loss/set_take_profit/close_position supaya
+    request ke exchange (size, holdSide) dibangun dari kondisi live saat
+    itu, bukan dari DB yang bisa basi (posisi sudah di-close manual di
+    exchange tapi belum ke-sync ke DB — gap WS/reconciliation).
+
+    Return {'size': float, 'direction': str} kalau posisi live ditemukan
+    & size > 0. Return None kalau posisi tidak ada/sudah closed, ATAU
+    fetch-nya sendiri gagal (network/exchange error) — caller WAJIB
+    menghentikan aksi kalau None, bukan diam-diam fallback ke data DB.
+    """
+    try:
+        positions = await client.fetch_positions([pair])
+    except Exception as exc:
+        logger.warning(
+            "[order_manager] gagal fetch live position %s sebelum place order: %s",
+            pair, exc,
+        )
+        return None
+
+    for pos in positions:
+        if pos.get("symbol") != pair:
+            continue
+        size = _safe_float(pos.get("contracts") or pos.get("contractSize"))
+        if size <= 0:
+            continue
+        side = (pos.get("side") or "").lower()
+        direction = Direction.SHORT if side == "short" else Direction.LONG
+        return {"size": size, "direction": direction}
+    return None
+
+
 # ── 1. Set Stop Loss ─────────────────────────────────────────────────────────
 
 async def _place_sl_order(
@@ -381,14 +417,28 @@ async def set_stop_loss(
         )
 
     pair = trade["pair"]
-    direction = trade.get("direction", Direction.LONG)
-    position_size = _safe_float(trade.get("position_size"))
+    db_position_size = _safe_float(trade.get("position_size"))
     old_sl_order_id = trade.get("sl_order_id")
 
-    if position_size <= 0:
+    # Live posisi TEPAT SEBELUM place order — bukan DB, yang bisa basi
+    # (posisi sudah closed manual di exchange tapi belum ke-sync ke DB).
+    live_pos = await _fetch_live_position_or_none(client, pair)
+    if live_pos is None:
         return OrderManagementResult(
             success=False, operation="set_sl", pair=pair, trade_id=trade_id,
-            failure_reason="invalid_position_size: position_size=0", is_critical=False,
+            failure_reason=(
+                "Posisi tidak ditemukan live di exchange (mungkin sudah "
+                "closed manual, atau fetch ke exchange gagal) — SL "
+                "dibatalkan, tidak lanjut pakai data DB basi."
+            ),
+            is_critical=False,
+        )
+    direction = live_pos["direction"]
+    position_size = live_pos["size"]
+    if db_position_size > 0 and abs(position_size - db_position_size) > db_position_size * 0.01:
+        logger.warning(
+            "[order_manager] set_sl %s: size live (%.8g) beda dari DB (%.8g) — pakai live.",
+            pair, position_size, db_position_size,
         )
 
     # Cancel SL order lama (kalau ada) SEBELUM pasang yang baru, supaya
@@ -621,14 +671,26 @@ async def set_take_profit(
         )
 
     pair = trade["pair"]
-    direction = trade.get("direction", Direction.LONG)
-    position_size = _safe_float(trade.get("position_size"))
+    db_position_size = _safe_float(trade.get("position_size"))
     old_tp_order_id = trade.get("tp_order_id")
 
-    if position_size <= 0:
+    live_pos = await _fetch_live_position_or_none(client, pair)
+    if live_pos is None:
         return OrderManagementResult(
             success=False, operation="set_tp", pair=pair, trade_id=trade_id,
-            failure_reason="invalid_position_size: position_size=0", is_critical=False,
+            failure_reason=(
+                "Posisi tidak ditemukan live di exchange (mungkin sudah "
+                "closed manual, atau fetch ke exchange gagal) — TP "
+                "dibatalkan, tidak lanjut pakai data DB basi."
+            ),
+            is_critical=False,
+        )
+    direction = live_pos["direction"]
+    position_size = live_pos["size"]
+    if db_position_size > 0 and abs(position_size - db_position_size) > db_position_size * 0.01:
+        logger.warning(
+            "[order_manager] set_tp %s: size live (%.8g) beda dari DB (%.8g) — pakai live.",
+            pair, position_size, db_position_size,
         )
 
     if old_tp_order_id:
@@ -897,30 +959,39 @@ async def amend_entry_price(
         )
 
     pair = trade["pair"]
-    direction = trade.get("direction", Direction.LONG)
-    position_size = _safe_float(trade.get("position_size"))
+    db_direction = trade.get("direction", Direction.LONG)
+    db_position_size = _safe_float(trade.get("position_size"))
+    # sl_price dipakai buat reattach SL ke order baru — ini config trade kita
+    # sendiri (bukan state posisi/order di exchange), jadi tetap dari DB;
+    # tidak ada versi "live" karena order lama yang mau diganti belum jadi
+    # posisi (masih pending, SL belum aktif di exchange).
     sl_price = _safe_float(trade.get("sl_price")) or None
 
-    if position_size <= 0:
+    if db_position_size <= 0:
         return OrderManagementResult(
             success=False, operation="amend_entry", pair=pair, trade_id=trade_id,
             failure_reason="invalid_position_size: position_size=0", is_critical=False,
         )
 
-    # Cari order_id limit order lama yang live di exchange (DB tidak nyimpen
+    # Cari order limit lama yang live di exchange (DB tidak nyimpen
     # entry_order_id — pola fallback ini sama persis dengan cancel_pending_order()).
+    # Sekaligus jadi sumber size & direction LIVE buat order baru — bukan DB,
+    # yang bisa basi (order lama sudah fill/di-cancel manual tapi belum
+    # ke-sync ke DB).
     old_order_id: Optional[str] = None
+    live_order: Optional[Dict[str, Any]] = None
     try:
         open_orders = await client.fetch_open_orders(pair)
         if open_orders:
-            old_order_id = _parse_order_id(open_orders[0])
+            live_order = open_orders[0]
+            old_order_id = _parse_order_id(live_order)
     except Exception as exc:
         logger.warning(
             "[order_manager] amend_entry: gagal fetch open orders untuk %s: %s",
             pair, exc,
         )
 
-    if not old_order_id:
+    if not old_order_id or live_order is None:
         return OrderManagementResult(
             success=False, operation="amend_entry", pair=pair, trade_id=trade_id,
             failure_reason=(
@@ -929,6 +1000,18 @@ async def amend_entry_price(
                 "/status atau /positions sebelum coba lagi."
             ),
             is_critical=False,
+        )
+
+    live_size = _safe_float(live_order.get("amount") or live_order.get("remaining"))
+    live_side = (live_order.get("side") or "").lower()
+    direction = Direction.SHORT if live_side == "sell" else (
+        Direction.LONG if live_side == "buy" else db_direction
+    )
+    position_size = live_size if live_size > 0 else db_position_size
+    if db_position_size > 0 and live_size > 0 and abs(live_size - db_position_size) > db_position_size * 0.01:
+        logger.warning(
+            "[order_manager] amend_entry %s: size live order (%.8g) beda dari DB (%.8g) — pakai live.",
+            pair, live_size, db_position_size,
         )
 
     # Cancel order lama SEBELUM pasang yang baru — kalau cancel gagal fatal,
@@ -1131,13 +1214,25 @@ async def close_position(
         )
 
     pair = trade["pair"]
-    direction = trade.get("direction", Direction.LONG)
-    position_size = _safe_float(trade.get("position_size"))
+    db_position_size = _safe_float(trade.get("position_size"))
 
-    if position_size <= 0:
+    live_pos = await _fetch_live_position_or_none(client, pair)
+    if live_pos is None:
         return OrderManagementResult(
             success=False, operation="close_position", pair=pair, trade_id=trade_id,
-            failure_reason="invalid_position_size: position_size=0", is_critical=False,
+            failure_reason=(
+                "Posisi tidak ditemukan live di exchange (mungkin sudah "
+                "closed manual, atau fetch ke exchange gagal) — close "
+                "dibatalkan, tidak lanjut pakai data DB basi."
+            ),
+            is_critical=False,
+        )
+    direction = live_pos["direction"]
+    position_size = live_pos["size"]
+    if db_position_size > 0 and abs(position_size - db_position_size) > db_position_size * 0.01:
+        logger.warning(
+            "[order_manager] close_position %s: size live (%.8g) beda dari DB (%.8g) — pakai live.",
+            pair, position_size, db_position_size,
         )
 
     try:

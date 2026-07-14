@@ -39,7 +39,7 @@ from db.database import check_db_health
 logger = logging.getLogger(__name__)
 
 
-async def _reconcile_before_read() -> None:
+async def _reconcile_before_read() -> bool:
     """
     Cross-check DB open/pending trades vs posisi & order LIVE di exchange
     sebelum menampilkan /positions atau /dashboard. Tanpa ini, kalau WS
@@ -54,15 +54,23 @@ async def _reconcile_before_read() -> None:
     diam-diam" dari laporan.
 
     Dibungkus timeout supaya /positions dan /dashboard TIDAK PERNAH hang
-    menunggu exchange — fail-open ke data DB terakhir kalau reconcile lambat.
+    menunggu exchange. Kalau reconcile lambat/gagal, return False — caller
+    WAJIB hentikan laporan dan kabari user, bukan diam-diam tampilkan data
+    DB basi.
     """
     try:
         from bot.executor.order_sync import reconcile_on_startup
         await asyncio.wait_for(reconcile_on_startup(), timeout=8.0)
+        return True
     except asyncio.TimeoutError:
         logger.warning("Live reconciliation timeout (>8s) sebelum /positions atau /dashboard.")
-    except Exception as exc:  # noqa: BLE001 — laporan tetap harus tampil walau reconcile gagal
+        return False
+    except Exception as exc:  # noqa: BLE001 — laporan dihentikan, jangan fail-open
         logger.warning(f"Live reconciliation gagal sebelum /positions atau /dashboard: {exc}")
+        return False
+
+
+_RECONCILE_FAIL_MSG = "❌ Gagal verifikasi ke exchange, coba lagi."
 
 
 async def _fetch_balance():
@@ -108,7 +116,9 @@ async def _send(update: Update, text: str) -> None:
 
 @authorized
 async def cmd_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _reconcile_before_read()
+    if not await _reconcile_before_read():
+        await _send(update, _RECONCILE_FAIL_MSG)
+        return
     balance = await _fetch_balance()
     summary = await async_get_open_trades_summary()
     daily = get_daily_stats()
@@ -118,7 +128,9 @@ async def cmd_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 @authorized
 async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _reconcile_before_read()
+    if not await _reconcile_before_read():
+        await _send(update, _RECONCILE_FAIL_MSG)
+        return
     trades = await async_get_open_trades()
     live_positions = await _fetch_live_positions()
     await _send(update, fmt_positions(trades, live_positions))
