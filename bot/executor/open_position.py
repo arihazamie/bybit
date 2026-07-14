@@ -104,6 +104,7 @@ class ExecutionResult:
     trade_id: Optional[int] = None
     order_id: Optional[str] = None
     is_dry_run: bool = False
+    entry_type: Optional[str] = None
 
     # Leverage yang dipakai (setelah safety adjustment Step 10)
     leverage_used: Optional[float] = None
@@ -459,7 +460,9 @@ async def open_position(
             is_critical=False,
         )
 
-    if entry_type == EntryType.LIMIT and signal.entry_price is None:
+    if entry_type == EntryType.LIMIT and (
+        signal.entry_price is None or signal.entry_price <= 0
+    ):
         return ExecutionResult(
             success=False,
             pair=pair,
@@ -604,6 +607,7 @@ async def open_position(
         trade_id=trade_id,
         order_id=order_id if order_id and order_id != "DRY_RUN" else None,
         is_dry_run=is_dry,
+        entry_type=entry_type,
         leverage_used=float(leverage_used),
         leverage_adjusted=safety.leverage_adjusted,
         entry_price_actual=entry_price_actual,
@@ -635,7 +639,7 @@ def format_execution_notification(result: ExecutionResult) -> str:
 
     dry_tag = "🔵 [DRY-RUN] " if result.is_dry_run else ""
     entry_type_label = (
-        "⏳ Limit order" if result.order_id or result.is_dry_run else "🚀 Market order"
+        "⏳ Limit order" if result.entry_type == EntryType.LIMIT else "🚀 Market order"
     )
     lines = [
         f"{dry_tag}✅ {entry_type_label} dikirim: {result.pair}",

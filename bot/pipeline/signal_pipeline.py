@@ -488,6 +488,13 @@ class SignalPipeline:
         """
         last_failure_reason: Optional[str] = None
 
+        # Delay kecil sebelum attempt pertama — posisi baru fill lewat market
+        # order kadang belum langsung ke-query di endpoint fetch_positions
+        # exchange (propagation lag singkat). Tanpa ini, attempt pertama bisa
+        # gagal spurious ("posisi belum ketemu") padahal order-nya beneran
+        # sudah fill, buang 1 dari SL_SET_MAX_ATTEMPTS jatah retry percuma.
+        await asyncio.sleep(0.7)
+
         for attempt in range(1, SL_SET_MAX_ATTEMPTS + 1):
             try:
                 sl_result: OrderManagementResult = await set_stop_loss(
@@ -580,31 +587,6 @@ class SignalPipeline:
             await notify(
                 f"⚠️ TP RR1:2 (@ <code>{tp_price:g}</code>) gagal dipasang untuk "
                 f"{pair}: {tp_result.failure_reason}. Set manual via /settp kalau perlu."
-            )
-
-        try:
-            close_result: OrderManagementResult = await close_position(
-                trade_id=trade_id,
-                close_reason=CloseReason.SL_FAILED,
-                rest_client=client,
-            )
-        except Exception as exc:
-            logger.exception(
-                "[pipeline] auto-close juga GAGAL untuk %s (trade_id=%s): %s",
-                pair, trade_id, exc,
-            )
-            await notify(
-                f"🚨 <b>AUTO-CLOSE JUGA GAGAL</b> untuk {pair} (trade_id={trade_id}): {exc}\n"
-                f"<b>TUTUP POSISI MANUAL SEKARANG di exchange — tidak ada proteksi SL sama sekali!</b>"
-            )
-            return
-
-        if close_result.success:
-            await notify(f"✅ Posisi {pair} (trade #{trade_id}) berhasil di-close otomatis.")
-        else:
-            await notify(
-                f"🚨 Auto-close gagal untuk {pair}: {close_result.failure_reason}\n"
-                f"<b>TUTUP POSISI MANUAL SEKARANG di exchange — tidak ada proteksi SL sama sekali!</b>"
             )
 
     async def _handle_position_check(

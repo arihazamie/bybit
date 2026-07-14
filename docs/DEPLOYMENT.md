@@ -14,6 +14,7 @@
 6. [Menjalankan Bot](#6-menjalankan-bot)
 7. [Urutan Pengujian Demo](#7-urutan-pengujian-demo)
 8. [Monitoring & Log](#8-monitoring--log)
+   - [8.4 Reconciliation & live-data safety](#84-reconciliation--live-data-safety)
 9. [Command Telegram Referensi Cepat](#9-command-telegram-referensi-cepat)
 10. [Checklist Go-Live (API Key Real)](#10-checklist-go-live-api-key-real)
 11. [Troubleshooting](#11-troubleshooting)
@@ -22,14 +23,14 @@
 
 ## 1. Prasyarat
 
-| Kebutuhan | Versi / Catatan |
-|-----------|-----------------|
-| Python | 3.11+ |
-| OS | Linux/macOS/WSL2 (Windows native tidak direkomendasikan) |
-| RAM | Minimal 512 MB |
-| Koneksi internet | Stabil (WebSocket butuh koneksi persisten) |
-| Akun Bitget | Demo dulu, live nanti |
-| Akun Telegram | Untuk Telethon (akun pribadi) + satu bot via @BotFather |
+| Kebutuhan        | Versi / Catatan                                          |
+| ---------------- | -------------------------------------------------------- |
+| Python           | 3.11+                                                    |
+| OS               | Linux/macOS/WSL2 (Windows native tidak direkomendasikan) |
+| RAM              | Minimal 512 MB                                           |
+| Koneksi internet | Stabil (WebSocket butuh koneksi persisten)               |
+| Akun Bitget      | Demo dulu, live nanti                                    |
+| Akun Telegram    | Untuk Telethon (akun pribadi) + satu bot via @BotFather  |
 
 ```bash
 # Cek versi Python
@@ -48,11 +49,13 @@ pip install -r requirements.txt
 ## 2. Setup Bitget Demo API
 
 ### 2.1 Aktifkan Paper Trading
+
 1. Login ke [bitget.com](https://www.bitget.com)
 2. Buka **Futures** → klik profil → **Paper Trading / Demo Trading**
 3. Pastikan sudah ada saldo demo (biasanya $10,000 USDT otomatis diberikan)
 
 ### 2.2 Buat API Key Demo
+
 1. Di halaman Paper Trading → **API Management**
 2. Klik **Create API Key**
 3. Centang permission: `Read`, `Trade`, `Transfer` (jangan Withdraw)
@@ -65,6 +68,7 @@ pip install -r requirements.txt
 ## 3. Setup Telegram
 
 ### 3.1 Telethon (Listener sinyal)
+
 Telethon butuh `api_id` dan `api_hash` dari akun Telegram pribadi:
 
 1. Buka [my.telegram.org](https://my.telegram.org)
@@ -75,12 +79,15 @@ Telethon butuh `api_id` dan `api_hash` dari akun Telegram pribadi:
 Saat pertama kali dijalankan, Telethon akan meminta kode OTP yang dikirim ke akun Telegram kamu.
 
 ### 3.2 Control Bot (@BotFather)
+
 1. Chat dengan [@BotFather](https://t.me/BotFather) di Telegram
 2. `/newbot` → ikuti instruksi → catat **bot token**
 3. Isi `TELEGRAM_BOT_TOKEN` di `.env`
 
 ### 3.3 Chat ID untuk notifikasi
+
 Cara mudah mendapatkan `TELEGRAM_CONTROL_CHAT_ID`:
+
 1. Start bot yang baru dibuat
 2. Kirim `/start` ke bot
 3. Buka: `https://api.telegram.org/bot<TOKEN>/getUpdates`
@@ -89,6 +96,7 @@ Cara mudah mendapatkan `TELEGRAM_CONTROL_CHAT_ID`:
 Isi `TELEGRAM_CONTROL_CHAT_ID` dengan ID tersebut.
 
 ### 3.4 Grup sinyal
+
 1. Masuk ke grup sinyal lewat akun Telegram pribadi (bukan bot)
 2. Cari `SIGNAL_CHANNEL_ID` (ID negatif untuk grup):
    - Forward pesan dari grup ke [@userinfobot](https://t.me/userinfobot)
@@ -149,13 +157,14 @@ DB_PATH=data/bot.db
 
 Bot memiliki **tiga lapisan** kontrol yang bisa dikombinasikan:
 
-| Mode | Setting | Efek |
-|------|---------|------|
-| **Dry Run** | `DRY_RUN=true` | Pipeline berjalan penuh tapi **tidak ada order** yang dikirim ke exchange. Semua dicatat di log dan database sebagai simulasi. |
-| **Sandbox** | `BITGET_USE_SANDBOX=true` | Order dikirim ke **Bitget Demo**, bukan akun live. |
-| **Live** | `DRY_RUN=false` + `BITGET_USE_SANDBOX=false` | Order **nyata** ke akun Bitget live. Hati-hati! |
+| Mode        | Setting                                      | Efek                                                                                                                           |
+| ----------- | -------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| **Dry Run** | `DRY_RUN=true`                               | Pipeline berjalan penuh tapi **tidak ada order** yang dikirim ke exchange. Semua dicatat di log dan database sebagai simulasi. |
+| **Sandbox** | `BITGET_USE_SANDBOX=true`                    | Order dikirim ke **Bitget Demo**, bukan akun live.                                                                             |
+| **Live**    | `DRY_RUN=false` + `BITGET_USE_SANDBOX=false` | Order **nyata** ke akun Bitget live. Hati-hati!                                                                                |
 
 ### Urutan yang benar:
+
 ```
 Phase 1: DRY_RUN=true  + SANDBOX=true   → tes logika pipeline
 Phase 2: DRY_RUN=false + SANDBOX=true   → tes eksekusi order ke demo
@@ -167,6 +176,7 @@ Phase 3: DRY_RUN=false + SANDBOX=false  → live trading (setelah semua Phase 1-
 ## 6. Menjalankan Bot
 
 ### 6.1 Jalankan pertama kali
+
 ```bash
 # Aktifkan venv
 source .venv/bin/activate
@@ -176,18 +186,22 @@ python main.py
 ```
 
 Saat startup, bot akan:
+
 1. Validasi semua env var — crash jika ada yang kosong
 2. Init database SQLite
 3. Start control bot (polling Telegram)
 4. **Bot mulai dalam mode PAUSED** — tidak ada eksekusi sinyal sampai `/resume`
 
 ### 6.2 Kirim `/resume` ke control bot
+
 ```
 /resume
 ```
+
 Bot akan pindah ke HALF-OPEN state, coba koneksi test, lalu mulai aktif.
 
 ### 6.3 Jalankan sebagai background process (VPS)
+
 ```bash
 # Dengan nohup
 nohup python main.py > /var/log/bitget-bot/bot.log 2>&1 &
@@ -203,12 +217,15 @@ nohup python main.py > /var/log/bitget-bot/bot.log 2>&1 &
 Jalankan dalam urutan ini. Jangan lanjut ke fase berikutnya sampai fase sebelumnya lolos.
 
 ### Phase 1 — Unit Tests (tanpa API key)
+
 ```bash
 pytest tests/ -v --ignore=tests/test_demo_live.py
 ```
+
 Semua harus ✅ pass.
 
 ### Phase 2 — Demo Live Tests (butuh API key Demo)
+
 ```bash
 # Set env var
 export DEMO_LIVE_TESTS=true
@@ -235,6 +252,7 @@ Edit `.env`: `DRY_RUN=false`, `BITGET_USE_SANDBOX=true`, lalu jalankan bot.
 Ikuti checklist manual berikut:
 
 **A. Sinyal Valid**
+
 - [ ] Kirim pesan sinyal format lengkap ke grup Telegram yang dimonitor
 - [ ] Cek notifikasi masuk ke control bot: ringkasan sinyal sebelum eksekusi
 - [ ] Verifikasi order muncul di Bitget Demo (Paper Trading → Futures → Orders)
@@ -242,12 +260,14 @@ Ikuti checklist manual berikut:
 - [ ] Cek database: `sqlite3 data/bot.db "SELECT * FROM trades ORDER BY id DESC LIMIT 1;"`
 
 **B. Sinyal Ambigu**
+
 - [ ] Kirim pesan format tidak lengkap (tanpa SL)
 - [ ] Cek notifikasi: inline button muncul (Eksekusi / Abaikan / Edit dulu)
 - [ ] Test tombol "Abaikan"
 - [ ] Test tombol "Eksekusi" — pastikan pipeline lanjut ke eksekusi
 
 **C. Konflik Posisi**
+
 - [ ] Buka posisi ETH/USDT manual di Demo
 - [ ] Kirim sinyal baru ETH/USDT ke grup
 - [ ] Cek notifikasi konflik muncul dengan inline button
@@ -255,34 +275,40 @@ Ikuti checklist manual berikut:
 - [ ] Test tombol "Abaikan" — sinyal dilewati
 
 **D. Mode Risk**
+
 - [ ] Kirim `/setrisk 2` → verifikasi mode berubah via `/riskmode`
 - [ ] Kirim sinyal → verifikasi risk_amount = 2% dari balance
 - [ ] Kirim `/setmaxloss 10` → verifikasi mode Fixed USD aktif
 - [ ] Kirim sinyal → verifikasi risk_amount = $10 (konstan)
 
 **E. Leverage Safety**
+
 - [ ] Kirim sinyal dengan SL sangat dekat (SL 0.1% dari entry)
 - [ ] Cek notifikasi: apakah leverage diturunkan otomatis?
 - [ ] Cek log: `grep "leverage_adjusted" logs/bitget_bot.log`
 
 **F. Multi-Posisi Cross**
+
 - [ ] Buka 3+ posisi di pair berbeda
 - [ ] Kirim `/positions` — semua posisi terdaftar
 - [ ] Verifikasi recheck alert muncul jika ada posisi yang mendekati liquidation bersama
 
 **G. Circuit Breaker**
+
 - [ ] Matikan koneksi internet sementara (atau set API key salah)
 - [ ] Cek notifikasi: circuit breaker trip setelah 3 error
 - [ ] Kembalikan koneksi/API key → kirim `/resume`
 - [ ] Cek `/status` — semua komponen kembali CLOSED
 
 **H. Pause & Resume**
+
 - [ ] Kirim `/pause`
 - [ ] Kirim sinyal baru → tidak dieksekusi
 - [ ] Verifikasi monitoring posisi existing tetap berjalan (cek log)
 - [ ] Kirim `/resume` → eksekusi aktif kembali
 
 **I. Emergency**
+
 - [ ] Buka 2-3 posisi di Demo
 - [ ] Kirim `/closeall` → semua posisi ter-close
 - [ ] Verifikasi di Bitget Demo semua posisi sudah tutup
@@ -292,6 +318,7 @@ Ikuti checklist manual berikut:
 ## 8. Monitoring & Log
 
 ### 8.1 Lokasi log
+
 ```
 logs/
 ├── bitget_bot.log          # Log utama (INFO+)
@@ -322,6 +349,10 @@ sqlite3 data/bot.db "SELECT key, value FROM settings;"
 
 ### 8.3 Telegram commands untuk monitoring
 
+Interaksi utama sekarang lewat menu tombol (`/start`). Command di bawah ini
+tetap jalan sebagai fallback tersembunyi (tidak muncul di daftar "/" Telegram
+lagi, tapi bisa diketik manual):
+
 ```
 /status      → health tiap komponen (circuit breaker state, WS, listener)
 /dashboard   → ringkasan: posisi open, balance, P&L hari ini
@@ -330,11 +361,40 @@ sqlite3 data/bot.db "SELECT key, value FROM settings;"
 /settings    → semua setting aktif
 ```
 
+> `/dashboard`, `/positions`, dan `/pending` (baik command maupun tombol menu
+> 📊 Info) reconcile ke exchange dulu sebelum tampil. Kalau reconcile gagal
+> atau timeout (>8 detik), bot balas `❌ Gagal verifikasi ke exchange, coba
+lagi.` — bukan diam-diam menampilkan data DB yang mungkin sudah basi.
+
+### 8.4 Reconciliation & live-data safety
+
+Beberapa command/aksi tombol wajib sinkron ke exchange dulu **sebelum**
+membaca atau mengubah state posisi:
+
+| Aksi                                                                       | Reconcile dulu? | Kalau reconcile gagal                    |
+| -------------------------------------------------------------------------- | :-------------: | ---------------------------------------- |
+| `/dashboard`, `/positions`, `/pending`                                     |       ✅        | Laporan dihentikan, balas error          |
+| `/settp`, `/setsl`, `/setentry`, `/close`, `/closeall`, `/cancel`          |       ✅        | Aksi dihentikan, balas error             |
+| Menu tombol pilih-pair (📌 Kelola Posisi → Set TP/SL/Entry, Close, Cancel) |       ✅        | List pair tidak ditampilkan, balas error |
+
+Selain itu, saat order SL/TP/close/amend entry benar-benar dikirim ke Bitget,
+bot fetch posisi (`fetch_positions`) atau order pending (`fetch_open_orders`)
+**live** tepat sebelum request dibuat — bukan pakai `position_size`/
+`direction` dari DB. Kalau posisi/order-nya ternyata sudah tidak ada di
+exchange (misal sudah di-close manual), aksi dibatalkan dengan pesan error,
+bukan diam-diam kirim order dengan data basi.
+
 ---
 
 ## 9. Command Telegram Referensi Cepat
 
+> Interface utama sekarang menu tombol — ketik `/start` di control bot lalu
+> pilih 📊 Info / ⚖️ Risk & Leverage / 📌 Kelola Posisi / ⏯️ Kontrol Bot.
+> Command slash di bawah ini masih 100% jalan (fallback tersembunyi untuk yang
+> sudah hafal), cuma tidak lagi muncul di daftar autocomplete "/" Telegram.
+
 ### Risk Management
+
 ```
 /setrisk 1          → max loss = 1% dari total balance (mode Percent)
 /setmaxloss 5       → max loss = $5 per trade (mode Fixed USD)
@@ -342,12 +402,14 @@ sqlite3 data/bot.db "SELECT key, value FROM settings;"
 ```
 
 ### Leverage
+
 ```
 /setleverage ETH 20 → cap leverage ETH ke max 20x
 /leverage ETH       → cek max leverage + liquidation buffer
 ```
 
 ### Posisi
+
 ```
 /positions          → list semua posisi open
 /settp ETH 3200     → set Take Profit ETH di $3200
@@ -359,6 +421,7 @@ sqlite3 data/bot.db "SELECT key, value FROM settings;"
 ```
 
 ### Kontrol
+
 ```
 /pause              → stop eksekusi sinyal baru (monitoring posisi tetap jalan)
 /resume             → aktifkan kembali / reset circuit breaker
@@ -370,6 +433,7 @@ sqlite3 data/bot.db "SELECT key, value FROM settings;"
 ```
 
 ### Info
+
 ```
 /dashboard          → ringkasan balance, posisi, P&L
 /history 10         → 10 trade terakhir
@@ -383,6 +447,7 @@ sqlite3 data/bot.db "SELECT key, value FROM settings;"
 Centang SEMUA sebelum mengganti ke API key live:
 
 ### ✅ Testing selesai
+
 - [ ] `pytest tests/ -v` → semua unit test pass
 - [ ] `DEMO_LIVE_TESTS=true pytest tests/test_demo_live.py -v -m demo` → semua pass
 - [ ] Semua skenario manual Phase 3 lolos
@@ -390,6 +455,7 @@ Centang SEMUA sebelum mengganti ke API key live:
 - [ ] Kedua mode risk (Percent & Fixed USD) sudah diverifikasi
 
 ### ✅ Konfigurasi aman
+
 - [ ] `.env` tidak di-commit ke Git (ada di `.gitignore`)
 - [ ] Tidak ada API key hardcode di kode manapun
 - [ ] `DRY_RUN=false` di-set **secara sadar**, bukan tidak sengaja
@@ -397,18 +463,21 @@ Centang SEMUA sebelum mengganti ke API key live:
 - [ ] Conflict mode sudah dipilih (`/conflictmode`)
 
 ### ✅ Infrastruktur
+
 - [ ] Bot berjalan di VPS (bukan laptop) dengan uptime stabil
 - [ ] Log rotation berjalan (cek `logs/` tidak memenuhi disk)
 - [ ] Alert Telegram terkirim ke chat ID yang benar
 - [ ] Backup `data/bot.db` otomatis dijadwalkan (cron/rsync)
 
 ### ✅ Operasional
+
 - [ ] Kamu memahami cara `/pause` untuk menghentikan entry baru
 - [ ] Kamu memahami cara `/closeall` untuk emergency
 - [ ] Kamu memahami bahwa **mode Cross** → semua posisi berbagi pool margin
 - [ ] Kamu sudah membaca peringatan di `CATATAN PENTING` di `prompt.md`
 
 ### ✅ Langkah switch ke live
+
 ```bash
 # 1. Stop bot yang sedang jalan
 pkill -f "python main.py"
@@ -435,37 +504,46 @@ python main.py
 ## 11. Troubleshooting
 
 ### Bot tidak start: `ValueError: [CONFIG] Environment variable 'X' WAJIB`
+
 → Isi env var yang disebutkan di `.env`. Cek `.env.example` untuk daftar lengkap.
 
 ### Telethon: `SessionPasswordNeededError`
+
 → Akun Telegram kamu mengaktifkan 2FA. Isi `TELEGRAM_2FA_PASSWORD` di `.env`.
 
 ### Telethon: gagal join session setelah restart
+
 → Session file tersimpan di `data/telethon.session`. Jangan hapus file ini kecuali mau login ulang.
 
 ### `AuthenticationError` dari Bitget
+
 → API key salah, passphrase salah, atau IP tidak di-whitelist. Cek di Bitget API Management.
 
 ### Order ditolak: `invalid leverage`
+
 → Bitget membatasi leverage untuk pair tertentu berdasarkan tier margin. Bot akan fetch ulang max leverage secara otomatis — pastikan `set_leverage` dipanggil dengan nilai valid.
 
 ### Circuit breaker selalu OPEN
+
 → Cek `/status` untuk komponen mana yang trip. Baca log untuk error spesifik. Setelah perbaikan → `/resume`.
 
 ### WebSocket disconnect terus-menerus
+
 → Bisa karena rate limit atau koneksi tidak stabil. Bot punya reconnect otomatis. Jika masalah persisten, cek `CB_ERROR_THRESHOLD` di `.env`.
 
 ### Bot tidak merespons sinyal dari grup
+
 → Cek `SIGNAL_CHANNEL_ID` dan `SIGNAL_THREAD_ID`. Pastikan format angka benar (ID grup biasanya negatif, mis. `-1001234567890`).
 
 ### Posisi tidak masuk database setelah eksekusi
+
 → Cek log untuk `[executor]`. Mungkin order berhasil di exchange tapi ada exception saat insert ke DB. Cek `data/bot.db` manual dengan sqlite3.
 
 ---
 
 ## Catatan Versi
 
-| Step | Tanggal | Perubahan |
-|------|---------|-----------|
-| Step 19 | 2026-06 | Integrasi penuh pipeline end-to-end |
+| Step    | Tanggal | Perubahan                                |
+| ------- | ------- | ---------------------------------------- |
+| Step 19 | 2026-06 | Integrasi penuh pipeline end-to-end      |
 | Step 20 | 2026-06 | Demo live test suite + dokumentasi final |

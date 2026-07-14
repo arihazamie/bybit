@@ -34,7 +34,9 @@ Telegram Grup (sinyal)
         ├── [ccxt.pro WS]    ← monitor posisi & order realtime
         └── [Circuit Breaker]← trip jika ada critical error beruntun
 
-[Telegram Control Bot]       ← command /dashboard /setrisk /close dll.
+[Telegram Control Bot]       ← /start → menu tombol (Info/Risk/Posisi/Kontrol)
+                                 command lama (/dashboard /setrisk /close dll.)
+                                 tetap jalan sbg fallback tersembunyi
 ```
 
 ## Struktur Folder
@@ -97,7 +99,9 @@ python main.py
 > minta **kode OTP** yang dikirim ke akun Telegram pribadimu — masukkan
 > langsung di terminal (hanya terjadi sekali, session tersimpan setelahnya).
 >
-> Setelah bot jalan, kirim `/resume` ke control bot untuk mengaktifkan eksekusi sinyal.
+> Setelah bot jalan, ketik `/start` di control bot untuk buka menu tombol,
+> lalu tekan ⏯️ Kontrol Bot → Resume (atau kirim `/resume` langsung) untuk
+> mengaktifkan eksekusi sinyal.
 
 ## Aturan Penting
 
@@ -106,6 +110,8 @@ python main.py
 - Gunakan **Bitget Demo/Paper Trading API** (`BITGET_USE_SANDBOX=true`) sampai checklist go-live di `docs/DEPLOYMENT.md` selesai
 - Semua waktu backend UTC, tampil ke user dalam Asia/Jakarta
 - Mode Cross + leverage tinggi → recheck liquidation gabungan berjalan otomatis tiap ada posisi baru/tutup
+- Sebelum menampilkan data posisi (`/dashboard`, `/positions`, `/pending`) atau mengeksekusi aksi posisi (`/settp`, `/setsl`, `/setentry`, `/close`, `/closeall`, `/cancel`), bot **reconcile ke exchange dulu**; kalau reconcile gagal/timeout, aksi/laporan dihentikan dengan pesan error — bot tidak pernah diam-diam pakai data DB basi
+- Order SL/TP/close/amend entry selalu dibangun dari **posisi/order LIVE di exchange** (fetch tepat sebelum kirim), bukan dari kolom `position_size`/`direction` di DB
 
 ## Menjalankan Test
 
@@ -142,3 +148,8 @@ DEMO_LIVE_TESTS=true pytest tests/test_demo_live.py -v -m demo
 - [x] Step 20 — Testing live di Bitget Demo & dokumentasi final ✅
 
 **Build selesai.** Ikuti checklist di `docs/DEPLOYMENT.md` → bagian "Checklist Go-Live" sebelum switch ke API key live.
+
+### Hardening pasca Step 20
+
+- Reconcile-ke-exchange sekarang **fail-closed**: kalau gagal/timeout, command dihentikan (bukan fallback diam-diam ke DB basi) — berlaku di `/dashboard`, `/positions`, `/pending`, dan semua aksi pilih-pair di menu tombol.
+- `set_stop_loss`, `set_take_profit`, `close_position`, `amend_entry_price` (`bot/executor/order_manager.py`) fetch posisi/order **live** dari exchange tepat sebelum kirim order, dan berhenti kalau posisi/order-nya sudah tidak ada — bukan lagi asal pakai `position_size`/`direction` dari DB.
