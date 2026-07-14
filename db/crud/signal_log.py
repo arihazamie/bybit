@@ -24,17 +24,23 @@ logger = logging.getLogger(__name__)
 # Sync CRUD
 # ─────────────────────────────────────────────
 
-def is_message_processed(message_id: int) -> bool:
+def is_message_processed(message_id: int, chat_id: int = 0) -> bool:
     """
-    IDEMPOTENCY CHECK: apakah pesan dengan message_id ini sudah pernah diproses?
-    Return True jika sudah ada di DB, False jika belum.
+    IDEMPOTENCY CHECK: apakah pesan dengan (chat_id, message_id) ini sudah
+    pernah diproses? Return True jika sudah ada di DB, False jika belum.
+
+    message_id Telegram cuma unik PER-CHAT, bukan global — kalau listen
+    lebih dari satu grup, message_id BISA bentrok antar chat_id berbeda.
+    Makanya cek harus pasangan (chat_id, message_id), bukan message_id saja,
+    supaya sinyal valid dari chat lain tidak salah ke-skip.
 
     Fungsi ini WAJIB dipanggil sebelum memproses sinyal apapun.
     Jika return True → skip, jangan proses ulang.
     """
     with get_db() as conn:
         row = conn.execute(
-            "SELECT id FROM signal_log WHERE message_id = ?", (message_id,)
+            "SELECT id FROM signal_log WHERE chat_id = ? AND message_id = ?",
+            (chat_id, message_id),
         ).fetchone()
         return row is not None
 
@@ -124,11 +130,12 @@ def update_signal_action(
     return success
 
 
-def get_signal_log_by_message_id(message_id: int) -> Optional[dict]:
-    """Ambil satu record signal_log berdasarkan Telegram message_id."""
+def get_signal_log_by_message_id(message_id: int, chat_id: int = 0) -> Optional[dict]:
+    """Ambil satu record signal_log berdasarkan (chat_id, Telegram message_id)."""
     with get_db() as conn:
         row = conn.execute(
-            "SELECT * FROM signal_log WHERE message_id = ?", (message_id,)
+            "SELECT * FROM signal_log WHERE chat_id = ? AND message_id = ?",
+            (chat_id, message_id),
         ).fetchone()
         result = row_to_dict(row)
 
@@ -252,10 +259,10 @@ def _deserialize_signal_log(record: Optional[dict]) -> Optional[dict]:
 # Async versions
 # ─────────────────────────────────────────────
 
-async def async_is_message_processed(message_id: int) -> bool:
+async def async_is_message_processed(message_id: int, chat_id: int = 0) -> bool:
     """Async version of is_message_processed."""
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, is_message_processed, message_id)
+    return await loop.run_in_executor(None, is_message_processed, message_id, chat_id)
 
 
 async def async_create_signal_log(**kwargs) -> Optional[int]:
@@ -283,10 +290,10 @@ async def async_update_signal_action(
     return await loop.run_in_executor(None, _run)
 
 
-async def async_get_signal_log_by_message_id(message_id: int) -> Optional[dict]:
+async def async_get_signal_log_by_message_id(message_id: int, chat_id: int = 0) -> Optional[dict]:
     """Async version of get_signal_log_by_message_id."""
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, get_signal_log_by_message_id, message_id)
+    return await loop.run_in_executor(None, get_signal_log_by_message_id, message_id, chat_id)
 
 
 async def async_get_signal_logs_awaiting_confirmation() -> list[dict]:

@@ -72,6 +72,7 @@ from bot.risk_engine.risk_engine import (
 from config.settings import settings
 from core.constants import (
     Component,
+    CloseReason,
     EntryType,
     EventType,
     ParseStatus,
@@ -94,6 +95,15 @@ from notifications.notifier import notify
 from telegram import Bot
 
 logger = get_logger(__name__)
+
+# ── Retry SL setelah market order fill ─────────────────────────────────────
+# Market order fill instan tanpa SL — SL dipasang terpisah setelah fill
+# (lihat set_stop_loss). Kalau gagal, posisi live TANPA proteksi. Retry
+# beberapa kali dulu (transient error umum kayak rate-limit/network blip),
+# kalau tetap gagal semua attempt: auto-close posisi — jangan biarkan
+# posisi naked nunggu user baca notif Telegram & reaksi manual.
+SL_SET_MAX_ATTEMPTS = 3
+SL_SET_RETRY_DELAY_SECONDS = (2.0, 5.0, 10.0)  # delay sebelum attempt ke-2, ke-3, ...
 
 
 class SignalPipeline:
@@ -125,8 +135,14 @@ class SignalPipeline:
             return
 
         # ── Deduplication ──────────────────────────────────────────────
-        if message_id and await async_is_message_processed(message_id):
-            logger.debug("[pipeline] message_id=%s sudah diproses, skip.", message_id)
+        # message_id Telegram cuma unik PER-CHAT — kalau listen >1 grup,
+        # message_id BISA bentrok antar chat_id berbeda. Cek pakai pasangan
+        # (chat_id, message_id), bukan message_id saja.
+        if message_id and await async_is_message_processed(message_id, chat_id):
+            logger.debug(
+                "[pipeline] chat_id=%s message_id=%s sudah diproses, skip.",
+                chat_id, message_id,
+            )
             return
 
         # ── Evaluasi sinyal ────────────────────────────────────────────
@@ -428,33 +444,12 @@ class SignalPipeline:
                     f"Set SL manual segera di exchange!"
                 )
             else:
-                try:
-                    sl_result: OrderManagementResult = await set_stop_loss(
-                        trade_id=exec_result.trade_id,
-                        sl_price=parsed.stop_loss or risk.sl_price or 0.0,
-                        rest_client=client,
-                    )
-                except Exception as exc:
-                    # Defense in depth: apapun yang salah di sini (bug baru, error
-                    # tak terduga, dll) TIDAK BOLEH cuma ke-log diam-diam — posisi
-                    # sudah live di exchange TANPA proteksi SL, user wajib tahu
-                    # SEKARANG, bukan nanti pas cek log.
-                    logger.exception(
-                        "[pipeline] set_stop_loss meledak tak terduga untuk %s (trade_id=%s)",
-                        pair, exec_result.trade_id,
-                    )
-                    await notify(
-                        f"🔴 <b>SL GAGAL DISET</b> untuk {pair} (error tak terduga: {exc})\n"
-                        f"Trade #{exec_result.trade_id} — <b>SET SL MANUAL SEKARANG</b> di exchange!"
-                    )
-                else:
-                    if not sl_result.success:
-                        await notify(
-                            f"⚠️ Gagal set SL untuk {pair}: {sl_result.failure_reason}\n"
-                            f"Set SL manual segera!"
-                        )
-                    else:
-                        logger.info("[pipeline] SL set sukses untuk %s", pair)
+                await self._ensure_stop_loss(
+                    client=client,
+                    pair=pair,
+                    trade_id=exec_result.trade_id,
+                    sl_price=parsed.stop_loss or risk.sl_price or 0.0,
+                )
         elif settings.DRY_RUN:
             logger.info("[pipeline][DRY-RUN] SL tidak dikirim ke exchange.")
 
@@ -466,6 +461,98 @@ class SignalPipeline:
 
         # ── Recheck posisi existing (Step 10, bagian 4.3 langkah 5) ──
         await self._recheck_and_alert(client, pair)
+
+    async def _ensure_stop_loss(
+        self,
+        *,
+        client,
+        pair: str,
+        trade_id: int,
+        sl_price: float,
+    ) -> None:
+        """
+        Pasang SL untuk market order dengan retry otomatis. Kalau SEMUA
+        attempt gagal, auto-close posisi lewat market — posisi live tanpa
+        SL yang cuma diserahkan ke notif Telegram terbukti berisiko (user
+        mungkin tidak sempat baca/bereaksi sebelum harga bergerak).
+
+        Urutan: retry set_stop_loss (SL_SET_MAX_ATTEMPTS attempt, delay
+        SL_SET_RETRY_DELAY_SECONDS) → kalau tetap gagal semua → close_position
+        (CloseReason.SL_FAILED) → notify hasil akhirnya apapun itu.
+        """
+        last_failure_reason: Optional[str] = None
+
+        for attempt in range(1, SL_SET_MAX_ATTEMPTS + 1):
+            try:
+                sl_result: OrderManagementResult = await set_stop_loss(
+                    trade_id=trade_id,
+                    sl_price=sl_price,
+                    rest_client=client,
+                )
+            except Exception as exc:
+                last_failure_reason = f"error tak terduga: {exc}"
+                logger.exception(
+                    "[pipeline] set_stop_loss meledak tak terduga untuk %s "
+                    "(trade_id=%s, attempt=%d/%d)",
+                    pair, trade_id, attempt, SL_SET_MAX_ATTEMPTS,
+                )
+            else:
+                if sl_result.success:
+                    logger.info(
+                        "[pipeline] SL set sukses untuk %s (attempt=%d/%d)",
+                        pair, attempt, SL_SET_MAX_ATTEMPTS,
+                    )
+                    return
+                last_failure_reason = sl_result.failure_reason
+
+            if attempt < SL_SET_MAX_ATTEMPTS:
+                delay = SL_SET_RETRY_DELAY_SECONDS[
+                    min(attempt - 1, len(SL_SET_RETRY_DELAY_SECONDS) - 1)
+                ]
+                logger.warning(
+                    "[pipeline] set_stop_loss gagal untuk %s (attempt=%d/%d, "
+                    "reason=%s) — retry dalam %.0fs.",
+                    pair, attempt, SL_SET_MAX_ATTEMPTS, last_failure_reason, delay,
+                )
+                await asyncio.sleep(delay)
+
+        # ── Semua attempt habis, SL tetap gagal — auto-close posisi ──────
+        logger.error(
+            "[pipeline] SL GAGAL diset untuk %s setelah %d attempt "
+            "(trade_id=%s, reason terakhir=%s) — auto-close posisi.",
+            pair, SL_SET_MAX_ATTEMPTS, trade_id, last_failure_reason,
+        )
+        await notify(
+            f"🔴 <b>SL GAGAL DISET</b> untuk {pair} setelah {SL_SET_MAX_ATTEMPTS}x "
+            f"percobaan (alasan terakhir: {last_failure_reason}).\n"
+            f"Trade #{trade_id} — <b>posisi di-CLOSE otomatis</b> demi keamanan "
+            f"modal (tidak dibiarkan naked tanpa SL)."
+        )
+
+        try:
+            close_result: OrderManagementResult = await close_position(
+                trade_id=trade_id,
+                close_reason=CloseReason.SL_FAILED,
+                rest_client=client,
+            )
+        except Exception as exc:
+            logger.exception(
+                "[pipeline] auto-close juga GAGAL untuk %s (trade_id=%s): %s",
+                pair, trade_id, exc,
+            )
+            await notify(
+                f"🚨 <b>AUTO-CLOSE JUGA GAGAL</b> untuk {pair} (trade_id={trade_id}): {exc}\n"
+                f"<b>TUTUP POSISI MANUAL SEKARANG di exchange — tidak ada proteksi SL sama sekali!</b>"
+            )
+            return
+
+        if close_result.success:
+            await notify(f"✅ Posisi {pair} (trade #{trade_id}) berhasil di-close otomatis.")
+        else:
+            await notify(
+                f"🚨 Auto-close gagal untuk {pair}: {close_result.failure_reason}\n"
+                f"<b>TUTUP POSISI MANUAL SEKARANG di exchange — tidak ada proteksi SL sama sekali!</b>"
+            )
 
     async def _handle_position_check(
         self,

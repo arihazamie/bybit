@@ -85,6 +85,7 @@ class CloseReason:
     TP_HIT      = "tp_hit"
     MANUAL      = "manual_close"
     LIQUIDATED  = "liquidated"
+    SL_FAILED   = "sl_failed"  # auto-close: SL gagal diset setelah semua retry habis
 
 
 # ── Signal parse status ─────────────────────────────────────────────────

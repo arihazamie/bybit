@@ -99,8 +99,8 @@ DEFAULT_SETTINGS = {
 CREATE_SIGNAL_LOG_TABLE = """
 CREATE TABLE IF NOT EXISTS signal_log (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    message_id      INTEGER NOT NULL UNIQUE,    -- Telegram message ID; UNIQUE untuk idempotency
-    chat_id         INTEGER,
+    message_id      INTEGER NOT NULL,           -- Telegram message ID; UNIQUE hanya per-chat, bukan global
+    chat_id         INTEGER NOT NULL DEFAULT 0,
     sender_username TEXT,
     raw_text        TEXT NOT NULL,
     received_at     TEXT NOT NULL,              -- ISO8601 UTC
@@ -116,13 +116,18 @@ CREATE TABLE IF NOT EXISTS signal_log (
                                                 --  'confirmed_execute', 'confirmed_skip', 'info_logged'
     trade_id        INTEGER REFERENCES trades(id),  -- nullable; diisi jika trade berhasil dibuat
 
-    created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+
+    -- Idempotency: message_id Telegram cuma unik per-chat. Kalau listen >1
+    -- grup, message_id BISA bentrok antar chat_id berbeda — UNIQUE harus
+    -- gabungan (chat_id, message_id), bukan message_id sendirian.
+    UNIQUE(chat_id, message_id)
 );
 """
 
-# Index untuk idempotency check (O(1) lookup by message_id)
+# Index untuk idempotency check (O(1) lookup by chat_id + message_id)
 CREATE_SIGNAL_LOG_INDEX = """
-CREATE INDEX IF NOT EXISTS idx_signal_log_message_id ON signal_log(message_id);
+CREATE INDEX IF NOT EXISTS idx_signal_log_chat_message ON signal_log(chat_id, message_id);
 """
 
 # ─────────────────────────────────────────────
