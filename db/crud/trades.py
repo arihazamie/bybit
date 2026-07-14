@@ -331,14 +331,33 @@ def update_trade_sl(
     return updated
 
 
-def update_trade_tp(trade_id: int, new_tp_price: float) -> bool:
-    """Set atau update Take Profit untuk trade yang sedang open/pending."""
+def update_trade_tp(
+    trade_id: int,
+    new_tp_price: float,
+    tp_order_id: Optional[str] = None,
+) -> bool:
+    """
+    Set atau update Take Profit untuk trade yang sedang open/pending.
+
+    tp_order_id: opsional — id order TPSL take-profit yang baru dipasang di
+    exchange (hanya ada kalau trade sedang 'open' dan set_take_profit()
+    berhasil pasang order live). Disimpan supaya /settp berikutnya bisa
+    cancel order lama sebelum memasang yang baru. Jika None, kolom
+    tp_order_id tidak diubah (dipertahankan apa adanya).
+    """
     with get_db() as conn:
-        cur = conn.execute(
-            """UPDATE trades SET tp_price = ?
-               WHERE id = ? AND status IN ('open', 'pending')""",
-            (new_tp_price, trade_id),
-        )
+        if tp_order_id is not None:
+            cur = conn.execute(
+                """UPDATE trades SET tp_price = ?, tp_order_id = ?
+                   WHERE id = ? AND status IN ('open', 'pending')""",
+                (new_tp_price, tp_order_id, trade_id),
+            )
+        else:
+            cur = conn.execute(
+                """UPDATE trades SET tp_price = ?
+                   WHERE id = ? AND status IN ('open', 'pending')""",
+                (new_tp_price, trade_id),
+            )
         updated = cur.rowcount > 0
 
     if updated:
@@ -584,8 +603,10 @@ async def async_update_trade_sl(
     return await _run_in_executor(update_trade_sl, trade_id, new_sl_price, sl_order_id)
 
 
-async def async_update_trade_tp(trade_id: int, new_tp_price: float) -> bool:
-    return await _run_in_executor(update_trade_tp, trade_id, new_tp_price)
+async def async_update_trade_tp(
+    trade_id: int, new_tp_price: float, tp_order_id: Optional[str] = None
+) -> bool:
+    return await _run_in_executor(update_trade_tp, trade_id, new_tp_price, tp_order_id)
 
 
 async def async_update_trade_entry(trade_id: int, new_entry_price: float) -> bool:

@@ -81,6 +81,7 @@ from core.constants import (
     CloseReason,
     Component,
     Direction,
+    EntryType,
     EventType,
     Severity,
     TradeStatus,
@@ -92,9 +93,12 @@ from db.crud.trades import (
     async_close_trade,
     async_get_open_trades,
     async_get_trade_by_id,
+    async_update_trade_entry,
     async_update_trade_sl,
     async_update_trade_status,
+    async_update_trade_tp,
 )
+from bot.executor.open_position import _place_order as _place_entry_order
 from exchange.bitget.rest_client import BitgetRestClient, get_rest_client
 from exchange.bitget.retry import CriticalError, TransientError
 
@@ -445,6 +449,240 @@ async def set_stop_loss(
     )
 
 
+# ── 1b. Set Take Profit (TPSL, sama mekanisme dengan SL) ────────────────────
+#
+# Sama seperti SL: TPSL take-profit order TERIKAT ke posisi (holdSide), jadi
+# HANYA bisa dipasang kalau posisi sudah live di exchange (trade status
+# 'open', order entry sudah fill) — persis alasan yang sama kenapa SL trigger
+# order butuh posisi ada duluan (lihat docstring modul, bagian atas).
+#
+# Untuk trade yang masih 'pending' (limit order belum fill), TP TIDAK bisa
+# dipasang sebagai order live di exchange — tidak ada posisi untuk di-attach.
+# TP untuk trade pending tetap DB-only (caller/command harus cek status dulu
+# sebelum panggil set_take_profit()).
+#
+# params.takeProfitPrice adalah pasangan simetris dari params.stopLossPrice
+# (dijelaskan di docstring modul) — exchange.create_order() menolak kalau
+# lebih dari satu dari triggerPrice/stopLossPrice/takeProfitPrice/
+# trailingPercent dikirim sekaligus, jadi di sini HANYA takeProfitPrice.
+
+async def _place_tp_order(
+    client: BitgetRestClient,
+    symbol: str,
+    direction: str,
+    position_size: float,
+    tp_price: float,
+    dry_run: bool,
+) -> Dict[str, Any]:
+    if dry_run:
+        logger.info(
+            "[order_manager][DRY-RUN] Would place TP TPSL order: "
+            "%s %s takeProfitPrice=%g size=%g",
+            symbol, _hold_side(direction), tp_price, position_size,
+        )
+        return {"id": "DRY_RUN_TP", "symbol": symbol}
+
+    side = _opposite_side(direction)
+    hold_side = _hold_side(direction)
+
+    try:
+        exchange = await client._get_exchange()
+        raw = await exchange.create_order(
+            symbol=symbol,
+            type="market",
+            side=side,
+            amount=position_size,
+            price=None,
+            params={
+                "takeProfitPrice": tp_price,
+                "holdSide": hold_side,
+                "triggerType": "mark_price",
+                "productType": "USDT-FUTURES",
+            },
+        )
+        logger.info(
+            "[order_manager] TP TPSL order placed: %s trigger=%g → id=%s",
+            symbol, tp_price, _parse_order_id(raw),
+        )
+        return raw
+
+    except (CriticalError, TransientError):
+        raise
+    except ccxt.InvalidOrder as exc:
+        raise CriticalError(
+            f"[order_manager] TP order ditolak exchange untuk {symbol}: {exc}",
+            original=exc,
+        ) from exc
+    except ccxt.InsufficientFunds as exc:
+        raise CriticalError(
+            f"[order_manager] Insufficient funds saat set TP {symbol}: {exc}",
+            original=exc,
+        ) from exc
+    except ccxt.AuthenticationError as exc:
+        raise CriticalError(
+            f"[order_manager] Auth error saat set TP {symbol}: {exc}", original=exc
+        ) from exc
+    except ccxt.NetworkError as exc:
+        raise TransientError(
+            f"[order_manager] Network error saat set TP {symbol}: {exc}", original=exc
+        ) from exc
+    except ccxt.RequestTimeout as exc:
+        raise TransientError(
+            f"[order_manager] Timeout saat set TP {symbol}: {exc}", original=exc
+        ) from exc
+    except ccxt.RateLimitExceeded as exc:
+        raise TransientError(
+            f"[order_manager] Rate limit saat set TP {symbol}: {exc}", original=exc
+        ) from exc
+    except Exception as exc:
+        raise CriticalError(
+            f"[order_manager] Unexpected error saat set TP {symbol}: {exc}",
+            original=exc,
+        ) from exc
+
+
+async def _cancel_tp_order(
+    client: BitgetRestClient,
+    symbol: str,
+    tp_order_id: str,
+    dry_run: bool,
+) -> None:
+    """
+    Cancel TPSL take-profit order lama (best-effort), sebelum pasang yang baru.
+    Sama seperti _cancel_sl_order, tapi planType 'pos_profit' (simetris
+    dengan 'pos_loss' yang dipakai buat SL) — kegagalan cancel di sini
+    NON-FATAL, hanya di-log, tidak menghentikan pemasangan TP baru.
+    """
+    if dry_run:
+        logger.info(
+            "[order_manager][DRY-RUN] Would cancel old TP order %s for %s",
+            tp_order_id, symbol,
+        )
+        return
+    try:
+        exchange = await client._get_exchange()
+        await exchange.cancel_order(
+            tp_order_id, symbol,
+            params={
+                "stop": True,
+                "planType": "pos_profit",
+                "productType": "USDT-FUTURES",
+            },
+        )
+        logger.info(
+            "[order_manager] Old TP order cancelled: %s id=%s", symbol, tp_order_id
+        )
+    except ccxt.OrderNotFound:
+        logger.info(
+            "[order_manager] Old TP order %s untuk %s tidak ditemukan "
+            "(sudah fill/cancel/expired) — dianggap beres.",
+            tp_order_id, symbol,
+        )
+    except Exception as exc:
+        logger.warning(
+            "[order_manager] Gagal cancel TP order lama %s untuk %s (non-fatal, "
+            "lanjut pasang TP baru): %s",
+            tp_order_id, symbol, exc,
+        )
+
+
+async def set_take_profit(
+    trade_id: int,
+    tp_price: float,
+    *,
+    rest_client: Optional[BitgetRestClient] = None,
+    dry_run: Optional[bool] = None,
+) -> OrderManagementResult:
+    """
+    Set/update Take Profit LIVE di exchange untuk posisi yang SUDAH OPEN
+    (order entry sudah fill). Mirror persis alur set_stop_loss().
+
+    Caller WAJIB memastikan trade.status == 'open' sebelum panggil ini —
+    fungsi ini tidak divalidasi ulang di sini karena posisi_size=0 sendiri
+    sudah jadi guard utama (trade pending/closed biasanya position_size
+    belum/tidak relevan, tapi validasi status tetap tanggung jawab caller,
+    sama seperti set_stop_loss()).
+    """
+    is_dry = dry_run if dry_run is not None else settings.DRY_RUN
+    client = rest_client or get_rest_client()
+
+    try:
+        trade = await async_get_trade_by_id(trade_id)
+    except Exception as exc:
+        return OrderManagementResult(
+            success=False, operation="set_tp",
+            failure_reason=f"db_error: {exc}", is_critical=False,
+        )
+
+    if trade is None:
+        return OrderManagementResult(
+            success=False, operation="set_tp",
+            failure_reason=f"trade_not_found: id={trade_id}", is_critical=False,
+        )
+
+    pair = trade["pair"]
+    direction = trade.get("direction", Direction.LONG)
+    position_size = _safe_float(trade.get("position_size"))
+    old_tp_order_id = trade.get("tp_order_id")
+
+    if position_size <= 0:
+        return OrderManagementResult(
+            success=False, operation="set_tp", pair=pair, trade_id=trade_id,
+            failure_reason="invalid_position_size: position_size=0", is_critical=False,
+        )
+
+    if old_tp_order_id:
+        await _cancel_tp_order(client, pair, old_tp_order_id, is_dry)
+
+    try:
+        raw = await _place_tp_order(client, pair, direction, position_size, tp_price, is_dry)
+    except CriticalError as exc:
+        msg = f"Critical error saat set TP {pair} @ {tp_price}: {exc}"
+        logger.error("[order_manager] %s", msg)
+        await async_log_event(
+            EventType.OTHER, msg, component=Component.ORDER_EXECUTION,
+            severity=Severity.CRITICAL, trade_id=trade_id,
+        )
+        return OrderManagementResult(
+            success=False, operation="set_tp", pair=pair, trade_id=trade_id,
+            failure_reason=_humanize_exchange_error(exc.original or exc), is_critical=True,
+        )
+    except TransientError as exc:
+        msg = f"Transient error saat set TP {pair} @ {tp_price}: {exc}"
+        logger.warning("[order_manager] %s", msg)
+        await async_log_event(
+            EventType.OTHER, msg, component=Component.ORDER_EXECUTION,
+            severity=Severity.WARNING, trade_id=trade_id,
+        )
+        return OrderManagementResult(
+            success=False, operation="set_tp", pair=pair, trade_id=trade_id,
+            failure_reason=_humanize_exchange_error(exc.original or exc), is_critical=False,
+        )
+
+    tp_order_id = _parse_order_id(raw)
+
+    try:
+        await async_update_trade_tp(trade_id, tp_price, tp_order_id or None)
+    except Exception as exc:
+        logger.warning("[order_manager] DB update TP gagal (non-fatal): %s", exc)
+
+    dry_tag = "[DRY-RUN] " if is_dry else ""
+    msg = (
+        f"{dry_tag}TP set: {pair} {direction.upper()} @ {tp_price:g} | "
+        f"trade_id={trade_id} tp_order_id={tp_order_id or 'N/A'}"
+    )
+    await async_log_event(
+        EventType.OTHER, msg, component=Component.ORDER_EXECUTION,
+        severity=Severity.INFO, trade_id=trade_id,
+    )
+
+    return OrderManagementResult(
+        success=True, operation="set_tp", pair=pair, trade_id=trade_id,
+        sl_price=None, sl_order_id=None, is_dry_run=is_dry,
+        notes=[f"tp_order_id={tp_order_id or 'N/A'}"],
+    )
+
+
 # ── 2. Cancel Pending Order ──────────────────────────────────────────────────
 
 async def _cancel_exchange_order(
@@ -603,6 +841,186 @@ async def cancel_pending_order(
     return OrderManagementResult(
         success=True, operation="cancel_order", pair=pair, trade_id=trade_id,
         cancelled_order_id=oid, is_dry_run=is_dry,
+    )
+
+
+# ── 2b. Amend Entry Price (cancel order lama, pasang order baru) ────────────
+#
+# Bitget/ccxt di sini tidak dipakai lewat editOrder unified (butuh verifikasi
+# lebih lanjut apakah endpoint modify-order Bitget didukung penuh oleh versi
+# ccxt yang dipakai project ini) — supaya konsisten dan aman, /setentry
+# amend dikerjakan dengan pola yang SUDAH TERBUKTI dipakai di tempat lain
+# (persis workaround manual yang sebelumnya disarankan ke user):
+#   1. Cancel limit order lama di exchange.
+#   2. Pasang limit order BARU di harga baru, size & SL sama (reuse
+#      _place_order dari open_position.py — satu sumber logic yang sama
+#      dipakai saat entry order pertama kali dibuat, termasuk preset SL
+#      attach & marginMode).
+#   3. Update entry_price di DB.
+#
+# Kalau limit order lama sudah tidak ketemu di exchange (mis. sudah fill
+# duluan sebelum konfirmasi diproses), amend DIBATALKAN dengan alasan jelas
+# — TIDAK asal pasang order baru di atas posisi yang sudah live.
+
+async def amend_entry_price(
+    trade_id: int,
+    new_entry_price: float,
+    *,
+    rest_client: Optional[BitgetRestClient] = None,
+    dry_run: Optional[bool] = None,
+) -> OrderManagementResult:
+    is_dry = dry_run if dry_run is not None else settings.DRY_RUN
+    client = rest_client or get_rest_client()
+
+    try:
+        trade = await async_get_trade_by_id(trade_id)
+    except Exception as exc:
+        return OrderManagementResult(
+            success=False, operation="amend_entry",
+            failure_reason=f"db_error: {exc}", is_critical=False,
+        )
+
+    if trade is None:
+        return OrderManagementResult(
+            success=False, operation="amend_entry",
+            failure_reason=f"trade_not_found: id={trade_id}", is_critical=False,
+        )
+
+    if trade.get("status") != TradeStatus.PENDING:
+        return OrderManagementResult(
+            success=False, operation="amend_entry", trade_id=trade_id,
+            failure_reason=(
+                f"trade_not_pending: status={trade.get('status')} — entry price "
+                "hanya bisa diamend selama order masih pending (belum fill)."
+            ),
+            is_critical=False,
+        )
+
+    pair = trade["pair"]
+    direction = trade.get("direction", Direction.LONG)
+    position_size = _safe_float(trade.get("position_size"))
+    sl_price = _safe_float(trade.get("sl_price")) or None
+
+    if position_size <= 0:
+        return OrderManagementResult(
+            success=False, operation="amend_entry", pair=pair, trade_id=trade_id,
+            failure_reason="invalid_position_size: position_size=0", is_critical=False,
+        )
+
+    # Cari order_id limit order lama yang live di exchange (DB tidak nyimpen
+    # entry_order_id — pola fallback ini sama persis dengan cancel_pending_order()).
+    old_order_id: Optional[str] = None
+    try:
+        open_orders = await client.fetch_open_orders(pair)
+        if open_orders:
+            old_order_id = _parse_order_id(open_orders[0])
+    except Exception as exc:
+        logger.warning(
+            "[order_manager] amend_entry: gagal fetch open orders untuk %s: %s",
+            pair, exc,
+        )
+
+    if not old_order_id:
+        return OrderManagementResult(
+            success=False, operation="amend_entry", pair=pair, trade_id=trade_id,
+            failure_reason=(
+                "Tidak ada limit order live ditemukan di exchange untuk pair ini "
+                "— kemungkinan sudah fill atau sudah di-cancel duluan. Cek "
+                "/status atau /positions sebelum coba lagi."
+            ),
+            is_critical=False,
+        )
+
+    # Cancel order lama SEBELUM pasang yang baru — kalau cancel gagal fatal,
+    # JANGAN lanjut pasang order baru (bisa dobel exposure).
+    try:
+        await _cancel_exchange_order(client, pair, old_order_id, is_dry)
+    except CriticalError as exc:
+        msg = f"Critical error saat cancel order lama {pair} (amend entry): {exc}"
+        logger.error("[order_manager] %s", msg)
+        await async_log_event(
+            EventType.OTHER, msg, component=Component.ORDER_EXECUTION,
+            severity=Severity.CRITICAL, trade_id=trade_id,
+        )
+        return OrderManagementResult(
+            success=False, operation="amend_entry", pair=pair, trade_id=trade_id,
+            failure_reason=_humanize_exchange_error(exc.original or exc), is_critical=True,
+        )
+    except TransientError as exc:
+        msg = f"Transient error saat cancel order lama {pair} (amend entry): {exc}"
+        logger.warning("[order_manager] %s", msg)
+        await async_log_event(
+            EventType.OTHER, msg, component=Component.ORDER_EXECUTION,
+            severity=Severity.WARNING, trade_id=trade_id,
+        )
+        return OrderManagementResult(
+            success=False, operation="amend_entry", pair=pair, trade_id=trade_id,
+            failure_reason=_humanize_exchange_error(exc.original or exc), is_critical=False,
+        )
+
+    # Pasang limit order baru di harga baru — reuse logic entry order asli
+    # (preset SL attach, marginMode, dst) supaya konsisten dgn open_position().
+    try:
+        raw = await _place_entry_order(
+            client, pair, direction, EntryType.LIMIT,
+            position_size, new_entry_price, sl_price, is_dry,
+        )
+    except CriticalError as exc:
+        msg = f"Critical error saat pasang order baru {pair} (amend entry): {exc}"
+        logger.error("[order_manager] %s", msg)
+        await async_log_event(
+            EventType.OTHER, msg, component=Component.ORDER_EXECUTION,
+            severity=Severity.CRITICAL, trade_id=trade_id,
+        )
+        return OrderManagementResult(
+            success=False, operation="amend_entry", pair=pair, trade_id=trade_id,
+            failure_reason=(
+                "Order lama SUDAH ter-cancel tapi order baru GAGAL dipasang: "
+                f"{_humanize_exchange_error(exc.original or exc)} — pair ini "
+                "SEKARANG TIDAK PUNYA order sama sekali di exchange, cek manual "
+                "dan pasang ulang kalau perlu."
+            ),
+            is_critical=True,
+        )
+    except TransientError as exc:
+        msg = f"Transient error saat pasang order baru {pair} (amend entry): {exc}"
+        logger.warning("[order_manager] %s", msg)
+        await async_log_event(
+            EventType.OTHER, msg, component=Component.ORDER_EXECUTION,
+            severity=Severity.WARNING, trade_id=trade_id,
+        )
+        return OrderManagementResult(
+            success=False, operation="amend_entry", pair=pair, trade_id=trade_id,
+            failure_reason=(
+                "Order lama SUDAH ter-cancel tapi order baru GAGAL dipasang: "
+                f"{_humanize_exchange_error(exc.original or exc)} — pair ini "
+                "SEKARANG TIDAK PUNYA order sama sekali di exchange, coba lagi "
+                "atau pasang ulang manual."
+            ),
+            is_critical=False,
+        )
+
+    new_order_id = _parse_order_id(raw)
+
+    try:
+        await async_update_trade_entry(trade_id, new_entry_price)
+    except Exception as exc:
+        logger.warning("[order_manager] DB update entry gagal (non-fatal): %s", exc)
+
+    dry_tag = "[DRY-RUN] " if is_dry else ""
+    msg = (
+        f"{dry_tag}Entry amended: {pair} {direction.upper()} → {new_entry_price:g} | "
+        f"trade_id={trade_id} old_order_id={old_order_id} new_order_id={new_order_id or 'N/A'}"
+    )
+    await async_log_event(
+        EventType.OTHER, msg, component=Component.ORDER_EXECUTION,
+        severity=Severity.INFO, trade_id=trade_id,
+    )
+
+    return OrderManagementResult(
+        success=True, operation="amend_entry", pair=pair, trade_id=trade_id,
+        is_dry_run=is_dry,
+        notes=[f"new_order_id={new_order_id or 'N/A'}"],
     )
 
 
@@ -967,6 +1385,20 @@ def format_order_management_notification(result: OrderManagementResult) -> str:
         return (
             f"{dry_tag}🛑 Stop Loss set: {result.pair}\n"
             f"• Trigger @ {result.sl_price:g}{sl_id}\n"
+            f"• Trade ID: {result.trade_id}"
+        )
+
+    if result.operation == "set_tp":
+        note = f" ({result.notes[0]})" if result.notes else ""
+        return (
+            f"{dry_tag}🎯 Take Profit set: {result.pair}{note}\n"
+            f"• Trade ID: {result.trade_id}"
+        )
+
+    if result.operation == "amend_entry":
+        note = f" ({result.notes[0]})" if result.notes else ""
+        return (
+            f"{dry_tag}✏️ Entry price diamend: {result.pair}{note}\n"
             f"• Trade ID: {result.trade_id}"
         )
 

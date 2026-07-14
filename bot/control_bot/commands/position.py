@@ -23,10 +23,12 @@ from bot.control_bot.auth import authorized
 from bot.control_bot.inline.pending_store import make_pending_key, pending_store
 from bot.circuit_breaker.manager import get_circuit_breaker
 from bot.executor.order_manager import (
+    amend_entry_price,
     cancel_pending_order,
     close_all_positions,
     close_position,
     set_stop_loss,
+    set_take_profit,
 )
 from core.constants import CloseReason, Direction
 from core.logging_setup import get_logger
@@ -39,8 +41,6 @@ from db.crud.trades import (
     async_get_filled_open_trades,
     async_get_pending_trade_for_pair,
     async_get_pending_trades,
-    async_update_trade_entry,
-    async_update_trade_tp,
 )
 
 logger = get_logger(__name__)
@@ -190,8 +190,17 @@ async def cmd_settp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     await _reconcile_before_action()
-    trade = await async_get_open_trade_for_pair(pair)
+    trade = await async_get_filled_open_trade_for_pair(pair)
     if not trade:
+        pending = await async_get_pending_trade_for_pair(pair)
+        if pending:
+            await _send(
+                update,
+                f"❌ <code>{pair}</code> masih <b>PENDING</b> (order belum fill di exchange).\n"
+                f"TP belum bisa dipasang live — belum ada posisi untuk dipasangi TP order.\n"
+                f"Set TP lagi setelah order fill.",
+            )
+            return
         await _send(update, f"❌ Tidak ada posisi <b>OPEN</b> untuk <code>{pair}</code>.")
         return
 
@@ -211,8 +220,7 @@ async def cmd_settp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Entry    : <code>{entry_str}</code>\n"
         f"TP baru  : <code>{price:g}</code>\n"
         f"Trade    : #{trade['id']}\n\n"
-        f"<i>TP dicatat di database — tidak membuat order di exchange.\n"
-        f"Posisi ditutup manual saat harga mencapai TP.</i>",
+        f"<i>TP order akan dipasang LIVE di exchange (TPSL, terikat ke posisi).</i>",
         action="settp",
         pair=pair, trade_id=trade["id"], price=price,
     )
@@ -310,8 +318,8 @@ async def cmd_setentry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"Entry lama : <code>{old_str}</code>\n"
         f"Entry baru : <code>{price:g}</code>\n"
         f"Trade      : #{trade['id']}\n\n"
-        f"<i>Update di database saja. Limit order aktif di exchange\n"
-        f"tidak berubah — gunakan <code>/cancel {pair}</code> jika perlu buka ulang.</i>",
+        f"<i>Limit order lama akan di-cancel di exchange, lalu order baru\n"
+        f"dipasang di harga baru (SL lama tetap dipasang ulang otomatis).</i>",
         action="setentry",
         pair=pair, trade_id=trade["id"], price=price,
     )
@@ -559,19 +567,18 @@ async def handle_position_callback(
 
 async def _exec_settp(p: dict) -> str:
     pair, trade_id, price = p["pair"], p["trade_id"], p["price"]
-    try:
-        ok = await async_update_trade_tp(trade_id, price)
-    except Exception as exc:
-        return f"❌ Error saat set TP: {exc}"
-    if ok:
+    result = await set_take_profit(trade_id, price)
+    if result.success:
+        dry_tag = "🔵 [DRY-RUN] " if result.is_dry_run else ""
+        note = f"\n{result.notes[0]}" if result.notes else ""
         return (
-            f"✅ <b>Take Profit diset</b>\n\n"
+            f"{dry_tag}✅ <b>Take Profit dipasang di exchange</b>\n\n"
             f"Pair  : <code>{pair}</code>\n"
             f"TP    : <code>{price:g}</code>\n"
-            f"Trade : #{trade_id}\n\n"
-            f"<i>Dicatat di DB. Tutup posisi manual saat TP tercapai.</i>"
+            f"Trade : #{trade_id}{note}"
         )
-    return f"❌ Gagal set TP — trade #{trade_id} tidak ditemukan."
+    crit = "🔴 CRITICAL — " if result.is_critical else ""
+    return f"❌ {crit}Gagal set TP: {result.failure_reason}"
 
 
 async def _exec_setsl(p: dict) -> str:
@@ -592,20 +599,18 @@ async def _exec_setsl(p: dict) -> str:
 
 async def _exec_setentry(p: dict) -> str:
     pair, trade_id, price = p["pair"], p["trade_id"], p["price"]
-    try:
-        ok = await async_update_trade_entry(trade_id, price)
-    except Exception as exc:
-        return f"❌ Error saat set entry: {exc}"
-    if ok:
+    result = await amend_entry_price(trade_id, price)
+    if result.success:
+        dry_tag = "🔵 [DRY-RUN] " if result.is_dry_run else ""
+        note = f"\n{result.notes[0]}" if result.notes else ""
         return (
-            f"✅ <b>Entry price diupdate</b>\n\n"
+            f"{dry_tag}✅ <b>Entry price diamend di exchange</b>\n\n"
             f"Pair       : <code>{pair}</code>\n"
             f"Entry baru : <code>{price:g}</code>\n"
-            f"Trade      : #{trade_id}\n\n"
-            f"<i>Perhatian: limit order di exchange tidak otomatis berubah.\n"
-            f"Gunakan <code>/cancel {pair}</code> lalu biarkan sinyal baru masuk.</i>"
+            f"Trade      : #{trade_id}{note}"
         )
-    return f"❌ Gagal update entry — trade #{trade_id} tidak ditemukan."
+    crit = "🔴 CRITICAL — " if result.is_critical else ""
+    return f"❌ {crit}Gagal amend entry: {result.failure_reason}"
 
 
 async def _exec_close(p: dict) -> str:

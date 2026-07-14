@@ -81,9 +81,9 @@ _TEXT_INPUT_ACTIONS = {
 
 # Aksi pilih-pair dulu → (fungsi cmd_* lama, sumber daftar pair, prompt setelah pair dipilih)
 _PAIR_PICK_ACTIONS = {
-    "settp":    ("open",        cmd_settp,    "Kirim <b>harga TP</b> untuk <code>{pair}</code>."),
+    "settp":    ("open_only",   cmd_settp,    "Kirim <b>harga TP</b> untuk <code>{pair}</code>."),
     "setsl":    ("open_only",   cmd_setsl,    "Kirim <b>harga SL</b> untuk <code>{pair}</code>."),
-    "setentry": ("open",        cmd_setentry, "Kirim <b>harga entry</b> baru untuk <code>{pair}</code>."),
+    "setentry": ("pending",     cmd_setentry, "Kirim <b>harga entry</b> baru untuk <code>{pair}</code>."),
     "close":    ("open_only",   cmd_close,    None),   # zero-arg lanjutan setelah pair dipilih
     "cancel":   ("pending",     cmd_cancel,   None),
 }

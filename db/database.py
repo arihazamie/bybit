@@ -194,6 +194,7 @@ def _migrate_add_missing_columns(conn: sqlite3.Connection) -> None:
     migrations = {
         "trades": {
             "sl_order_id": "TEXT",
+            "tp_order_id": "TEXT",
         },
     }
 
