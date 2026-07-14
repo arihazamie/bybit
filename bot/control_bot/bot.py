@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import logging
 
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler
+from telegram.ext import (
+    Application, CallbackQueryHandler, CommandHandler, MessageHandler, filters,
+)
 
 from bot.control_bot.commands.info import (
     cmd_dashboard, cmd_history, cmd_positions, cmd_settings, cmd_status,
@@ -29,9 +31,10 @@ from bot.control_bot.commands.position import (
 )
 from bot.control_bot.inline.signal_confirm import handle_signal_callback
 from bot.control_bot.inline.conflict_confirm import handle_conflict_callback
+from bot.control_bot.menu.router import handle_menu_callback, handle_awaited_text
 from config.settings import settings
 
-from bot.control_bot.commands.help import cmd_help, set_bot_commands
+from bot.control_bot.commands.help import cmd_help, cmd_menu, set_bot_commands
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +53,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("settings",  cmd_settings))
     app.add_handler(CommandHandler("status",    cmd_status))
     app.add_handler(CommandHandler("help",  cmd_help))
-    app.add_handler(CommandHandler("start", cmd_help))
+    app.add_handler(CommandHandler("start", cmd_menu))
 
     # ── Step 16: Risk & leverage ───────────────────────────────────────
     app.add_handler(CommandHandler("setrisk",      cmd_setrisk))
@@ -79,6 +82,12 @@ def build_application() -> Application:
 
     # ── Step 18 callback: konflik posisi (conf:) ──────────────────────
     app.add_handler(CallbackQueryHandler(handle_conflict_callback, pattern=r"^conf:"))
+
+    # ── Step 8: menu tombol (menu:) — prefix beda, gak bentrok pos:/sig:/conf: ──
+    app.add_handler(CallbackQueryHandler(handle_menu_callback, pattern=r"^menu:"))
+
+    # ── Step 8: tangkap reply teks setelah tombol minta input ──────────
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_awaited_text))
 
     logger.info("Control bot built — %d handler terdaftar", len(app.handlers[0]))
     return app

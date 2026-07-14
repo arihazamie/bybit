@@ -37,6 +37,9 @@ def _make_update(text: str = "", args: list[str] | None = None):
     update.effective_chat.id = 12345
     update.message.reply_text = AsyncMock()
     update.message.text = text
+    # _send helper pakai update.effective_message (Step 6) — alias supaya
+    # assertion lama (update.message.reply_text...) tetap valid.
+    update.effective_message = update.message
     return update
 
 

@@ -69,7 +69,9 @@ async def _reconcile_before_action() -> None:
 
 
 async def _send(update: Update, text: str, reply_markup=None):
-    return await update.message.reply_text(
+    # effective_message tetap valid baik dipanggil dari command message
+    # maupun dari tombol menu (callback_query) — Step 1.
+    return await update.effective_message.reply_text(
         text, parse_mode=ParseMode.HTML, reply_markup=reply_markup
     )
 

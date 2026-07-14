@@ -37,7 +37,9 @@ _CONFLICT_MODES = {"ask", "skip", "add", "replace"}
 
 
 async def _send(update: Update, text: str) -> None:
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+    # effective_message tetap valid baik dipanggil dari command message
+    # maupun dari tombol menu (callback_query) — Step 1.
+    await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
 # ── /setrisk {persen} ─────────────────────────────────────────────────────────

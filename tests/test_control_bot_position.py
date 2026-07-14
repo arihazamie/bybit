@@ -33,6 +33,9 @@ def _make_update(text: str = "", args: list | None = None):
     update.effective_user.id = 111
     update.effective_chat = MagicMock()
     update.effective_chat.id = 111
+    # _send helper pakai update.effective_message (Step 6) — alias supaya
+    # assertion lama (update.message.reply_text...) tetap valid.
+    update.effective_message = update.message
     return update
 
 
