@@ -79,7 +79,7 @@ from exchange.bitget.rest_client import BitgetRestClient, get_rest_client
 from exchange.bitget.ws_client import OrderEvent, PositionEvent
 from notifications.notifier import notify
 
-from bot.executor.order_manager import set_stop_loss
+from bot.executor.order_manager import set_stop_loss, set_take_profit
 
 logger = get_logger(__name__)
 
@@ -315,13 +315,36 @@ async def _handle_order_filled(event: OrderEvent) -> None:
     # entry, tidak menunggu fill event ini). Kalau di-set lagi di sini juga,
     # hasilnya DOBEL SL order untuk trade yang sama. Handler ini sekarang
     # murni update status + notifikasi informasi fill.
+    #
+    # TP beda ceritanya: TPSL take-profit BUTUH posisi yang sudah live
+    # (holdSide terikat posisi, sama seperti SL trigger order) — makanya
+    # baru bisa dipasang DI SINI, setelah status trade jadi OPEN, bukan
+    # bareng entry order seperti SL preset. tp_price sudah terisi default
+    # RR1:2 sejak trade dibuat (lihat open_position._record_trade) kalau
+    # sinyal tidak kasih TP eksplisit.
+    tp_note = ""
+    tp_price = trade.get("tp_price")
+    if tp_price:
+        try:
+            tp_result = await set_take_profit(trade["id"], tp_price, rest_client=get_rest_client())
+        except Exception as exc:
+            logger.exception(
+                "[order_sync] set_take_profit meledak tak terduga untuk trade #%s", trade["id"],
+            )
+            tp_note = f"\n⚠️ TP @ <code>{tp_price:g}</code> gagal dipasang: error tak terduga ({exc})."
+        else:
+            if tp_result.success:
+                tp_note = f"\n🎯 TP @ <code>{tp_price:g}</code> terpasang otomatis (RR default kalau sinyal tanpa TP)."
+            else:
+                tp_note = f"\n⚠️ TP @ <code>{tp_price:g}</code> gagal dipasang: {tp_result.failure_reason}. Set manual via /settp."
+
     await notify(
         f"✅ <b>LIMIT ORDER FILLED</b>\n\n"
         f"Pair    : <code>{event.symbol}</code>\n"
         f"Trade   : #{trade['id']}\n"
         f"Harga   : <code>{fill_price_display}</code>\n\n"
         f"<i>Posisi sekarang berstatus OPEN. SL sudah terpasang sejak entry "
-        f"dikirim — cek notifikasi \"SL TERPASANG\" sebelumnya.</i>"
+        f"dikirim — cek notifikasi \"SL TERPASANG\" sebelumnya.</i>{tp_note}"
     )
 
 

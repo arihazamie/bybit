@@ -49,6 +49,7 @@ from bot.executor.order_manager import (
     cancel_pending_order,
     close_position,
     set_stop_loss,
+    set_take_profit,
 )
 from bot.leverage_engine.leverage_engine import (
     ExistingPositionSafetyAlert,
@@ -87,7 +88,7 @@ from db.crud.signal_log import (
     async_is_message_processed,
     async_update_signal_action,
 )
-from db.crud.trades import get_open_trades
+from db.crud.trades import async_get_trade_by_id, get_open_trades
 from exchange.bitget.market_data import get_default_market_cache
 from exchange.bitget.rest_client import get_rest_client
 from exchange.bitget.retry import CriticalError
@@ -450,6 +451,11 @@ class SignalPipeline:
                     trade_id=exec_result.trade_id,
                     sl_price=parsed.stop_loss or risk.sl_price or 0.0,
                 )
+                await self._ensure_take_profit(
+                    client=client,
+                    pair=pair,
+                    trade_id=exec_result.trade_id,
+                )
         elif settings.DRY_RUN:
             logger.info("[pipeline][DRY-RUN] SL tidak dikirim ke exchange.")
 
@@ -528,6 +534,53 @@ class SignalPipeline:
             f"Trade #{trade_id} — <b>posisi di-CLOSE otomatis</b> demi keamanan "
             f"modal (tidak dibiarkan naked tanpa SL)."
         )
+
+    async def _ensure_take_profit(
+        self,
+        *,
+        client,
+        pair: str,
+        trade_id: int,
+    ) -> None:
+        """
+        Pasang TP (RR 1:2 default, dihitung saat trade dibuat — lihat
+        open_position._record_trade / risk_engine.calculate_default_tp_price)
+        untuk market order, best-effort SEKALI percobaan.
+
+        BEDA dengan SL: kegagalan pasang TP TIDAK memicu auto-close posisi.
+        SL wajib ada demi proteksi modal; TP cuma target profit — posisi
+        tanpa TP tetap aman (SL sudah terpasang duluan di _ensure_stop_loss),
+        cukup dinotifikasi supaya bisa /settp manual kalau perlu.
+        """
+        trade = await async_get_trade_by_id(trade_id)
+        tp_price = trade.get("tp_price") if trade else None
+        if not tp_price:
+            return  # gagal hitung default TP saat create trade — skip diam-diam
+
+        try:
+            tp_result: OrderManagementResult = await set_take_profit(
+                trade_id=trade_id,
+                tp_price=tp_price,
+                rest_client=client,
+            )
+        except Exception as exc:
+            logger.exception(
+                "[pipeline] set_take_profit meledak tak terduga untuk %s (trade_id=%s)",
+                pair, trade_id,
+            )
+            await notify(
+                f"⚠️ TP RR1:2 (@ <code>{tp_price:g}</code>) gagal dipasang untuk "
+                f"{pair}: error tak terduga ({exc}). Set manual via /settp kalau perlu."
+            )
+            return
+
+        if tp_result.success:
+            logger.info("[pipeline] TP RR1:2 set sukses untuk %s @ %g", pair, tp_price)
+        else:
+            await notify(
+                f"⚠️ TP RR1:2 (@ <code>{tp_price:g}</code>) gagal dipasang untuk "
+                f"{pair}: {tp_result.failure_reason}. Set manual via /settp kalau perlu."
+            )
 
         try:
             close_result: OrderManagementResult = await close_position(

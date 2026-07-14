@@ -190,6 +190,27 @@ def calculate_sl_distance(entry_price: float, sl_price: float) -> float:
     return distance
 
 
+def calculate_default_tp_price(
+    direction: str,
+    entry_price: float,
+    sl_price: float,
+    rr: float = 2.0,
+) -> float:
+    """
+    Hitung TP default berbasis Risk:Reward — dipakai kalau sinyal TIDAK
+    mencantumkan harga TP (mayoritas sinyal memang tidak pernah kasih TP,
+    hanya entry + SL). Default RR 1:2: jarak TP dari entry = 2x jarak SL
+    dari entry, di sisi yang menguntungkan sesuai arah posisi.
+
+    LONG  -> TP = entry + rr * sl_distance (di atas entry)
+    SHORT -> TP = entry - rr * sl_distance (di bawah entry)
+    """
+    sl_distance = calculate_sl_distance(entry_price, sl_price)
+    if direction == Direction.LONG:
+        return entry_price + rr * sl_distance
+    return entry_price - rr * sl_distance
+
+
 def calculate_position_size(risk_amount: float, sl_distance: float) -> float:
     """
     Hitung position_size (unit aset) — bagian 4.4 langkah 2.

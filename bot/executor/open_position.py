@@ -63,7 +63,7 @@ import ccxt
 
 from bot.leverage_engine.leverage_engine import LeverageSafetyResult
 from bot.parser.signal_parser import ParsedSignal
-from bot.risk_engine.risk_engine import RiskCalculationResult
+from bot.risk_engine.risk_engine import RiskCalculationResult, calculate_default_tp_price
 from config.settings import settings
 from core.constants import (
     Component,
@@ -351,13 +351,33 @@ async def _record_trade(
 
     order_id_str = _parse_order_id(order_raw)
 
+    sl_price_final = risk.sl_price or signal.stop_loss or 0.0
+
+    # Sinyal HAMPIR TIDAK PERNAH kasih harga TP (cuma entry + SL) — default
+    # ke RR 1:2 dari SL supaya TP tetap kepasang otomatis di exchange
+    # (lihat signal_pipeline.py / order_sync.py, TP dipasang begitu posisi
+    # OPEN). Kalau kebetulan sl_price/entry_price invalid (gagal hitung
+    # distance), fallback None — TP-nya nanti diset manual via /settp.
+    tp_price_default: Optional[float] = None
+    if entry_price_actual > 0 and sl_price_final > 0:
+        try:
+            tp_price_default = calculate_default_tp_price(
+                signal.direction or Direction.LONG, entry_price_actual, sl_price_final,
+            )
+        except ValueError as exc:
+            logger.warning(
+                "[executor] Gagal hitung default TP RR2 untuk %s: %s — "
+                "TP dibiarkan kosong, set manual via /settp.",
+                signal.pair_normalized or signal.pair_raw, exc,
+            )
+
     trade_id = await async_create_trade(
         pair=signal.pair_normalized or signal.pair_raw or "",
         direction=signal.direction or Direction.LONG,
         entry_type=entry_type,
         entry_price=entry_price_actual,
-        sl_price=risk.sl_price or signal.stop_loss or 0.0,
-        tp_price=None,
+        sl_price=sl_price_final,
+        tp_price=tp_price_default,
         position_size=risk.position_size or 0.0,
         margin_used=risk.margin_needed,
         risk_mode=risk.risk_mode,
