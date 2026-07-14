@@ -20,13 +20,15 @@ Alur nominal:
       PROCEED/ADD/REPLACE ↓
     ↓ calculate_trade_risk()    [risk engine Step 9]
     ↓ run_leverage_safety_check() [leverage engine Step 10]
-    ↓ open_position()           [executor Step 12 — SL wajib attached di request
-                                  kalau LIMIT (params.stopLossPrice), sl_price
-                                  kosong = order ditolak sebelum kirim ke exchange]
-    ↓ set_stop_loss()            [executor Step 13 — HANYA untuk MARKET order
-                                  (fill instan → SL dipasang terpisah setelah
-                                  fill). LIMIT sudah punya SL dari Step 12,
-                                  jadi di-skip di sini supaya tidak dobel.]
+    ↓ open_position()           [executor Step 12 — SL + TP (default RR1:2)
+                                  WAJIB attached atomically di request order
+                                  itu sendiri (params preset stopLoss/
+                                  takeProfit), untuk MARKET maupun LIMIT.
+                                  sl_price kosong = order ditolak sebelum
+                                  kirim ke exchange. Tidak ada lagi langkah
+                                  "set SL/TP terpisah setelah fill" di alur
+                                  otomatis — set_stop_loss()/set_take_profit()
+                                  sekarang cuma dipakai /setsl /settp manual.]
     ↓ recheck_existing_positions() [leverage engine Step 10]
     ↓ notify result
 
@@ -432,32 +434,20 @@ class SignalPipeline:
                 )
             return
 
-        # ── Set SL (Step 13) — HANYA untuk market order ─────────────────
-        # Limit order SUDAH wajib bawa SL attached (params.stopLossPrice)
-        # sejak open_position() (Step 12) — kalau sl_price kosong, order
-        # ditolak DI SANA, tidak pernah sampai sini. Panggil set_stop_loss
-        # lagi di sini untuk limit order akan bikin SL DOBEL di exchange.
-        if parsed.entry_type != EntryType.LIMIT and not settings.DRY_RUN:
-            if exec_result.trade_id is None:
-                await notify(
-                    f"⚠️ Order {pair} terkirim tapi trade_id tidak tercatat di DB "
-                    f"(lihat notif error sebelumnya) — SL TIDAK bisa diset otomatis.\n"
-                    f"Set SL manual segera di exchange!"
-                )
-            else:
-                await self._ensure_stop_loss(
-                    client=client,
-                    pair=pair,
-                    trade_id=exec_result.trade_id,
-                    sl_price=parsed.stop_loss or risk.sl_price or 0.0,
-                )
-                await self._ensure_take_profit(
-                    client=client,
-                    pair=pair,
-                    trade_id=exec_result.trade_id,
-                )
-        elif settings.DRY_RUN:
-            logger.info("[pipeline][DRY-RUN] SL tidak dikirim ke exchange.")
+        # ── Set SL/TP terpisah (Step 13) — SEKARANG TIDAK DIPANGGIL LAGI
+        # di sini untuk market MAUPUN limit. Sejak open_position() (Step 12)
+        # attach SL+TP atomically ke request order itu sendiri (params
+        # preset stopLoss/takeProfit) untuk KEDUA entry_type — kalau sl_price
+        # kosong, order sudah ditolak DI SANA, tidak pernah sampai sini.
+        # Panggil set_stop_loss/set_take_profit lagi di sini akan bikin SL/TP
+        # DOBEL di exchange (satu preset dari order entry, satu lagi trigger
+        # order terpisah dari sini) — berpotensi bentrok/konflik.
+        #
+        # _ensure_stop_loss/_ensure_take_profit tetap ada di bawah, dipakai
+        # oleh /setsl dan /settp manual (command Telegram), bukan bagian
+        # alur open otomatis lagi.
+        if settings.DRY_RUN:
+            logger.info("[pipeline][DRY-RUN] SL/TP tidak dikirim ke exchange.")
 
         # Update signal_log action
         if log_id:

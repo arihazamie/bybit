@@ -311,6 +311,7 @@ async def test_place_order_limit_uses_preset_stoploss_not_trigger_order():
         position_size=7.68233259,
         entry_price=42.8,
         sl_price=41.5,
+        tp_price=45.4,
         dry_run=False,
     )
 
@@ -322,5 +323,6 @@ async def test_place_order_limit_uses_preset_stoploss_not_trigger_order():
     assert "stopLossPrice" not in params
     assert "holdSide" not in params
 
-    # Parameter yang benar: preset SL via unified `stopLoss`.
+    # Parameter yang benar: preset SL + TP via unified `stopLoss`/`takeProfit`.
     assert params.get("stopLoss") == {"triggerPrice": 41.5}
+    assert params.get("takeProfit") == {"triggerPrice": 45.4}

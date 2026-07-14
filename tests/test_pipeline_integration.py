@@ -148,24 +148,29 @@ async def test_valid_signal_dry_run():
     assert "✅" in result or "Pipeline" in result or "selesai" in result
 
 
-# ── Test 1b: Sinyal MARKET (non dry-run) → set_stop_loss dipanggil dengan
-#             signature yang BENAR (regression test untuk bug TypeError
-#             'pair'/'direction' unexpected keyword argument) ────────────
+# ── Test 1b: Sinyal MARKET (non dry-run) → set_stop_loss TIDAK dipanggil
+#             lagi dari pipeline (SL+TP sekarang attached atomically di
+#             open_position() untuk market maupun limit — lihat
+#             bot/executor/open_position.py) ──────────────────────────────
 
 @pytest.mark.asyncio
-async def test_market_signal_calls_set_stop_loss_with_correct_signature():
+async def test_market_signal_does_not_call_separate_set_stop_loss():
     """
-    Regression test: pipeline sempat memanggil set_stop_loss(trade_id=.., pair=..,
-    direction=.., sl_price=.., rest_client=..) padahal signature aslinya di
-    order_manager.py cuma (trade_id, sl_price, *, rest_client, dry_run) — extra
-    kwargs 'pair'/'direction' bikin TypeError yang ke-swallow diam-diam oleh
-    except Exception generik di _execute_valid_signal, jadi SL TIDAK PERNAH
-    benar-benar terkirim ke exchange walau notifikasi entry sudah "✅ sukses".
+    Regression test (versi baru): dulu pipeline sempat memanggil
+    set_stop_loss(trade_id=.., pair=.., direction=.., sl_price=.., rest_client=..)
+    terpisah setelah market order fill — signature salah (extra kwargs
+    'pair'/'direction') bikin TypeError yang ke-swallow diam-diam, SL TIDAK
+    PERNAH benar-benar terkirim ke exchange walau notifikasi entry sudah
+    "✅ sukses".
 
-    Test ini pakai entry_type=MARKET + DRY_RUN=False (satu-satunya kondisi yang
-    memicu pemanggilan set_stop_loss — lihat test_valid_signal_dry_run yang
-    selalu DRY_RUN=True dan skip jalur ini sepenuhnya) dan assert set_stop_loss
-    dipanggil TANPA kwargs 'pair'/'direction'.
+    Sekarang SL (+ TP default RR1:2) di-attach ATOMIC ke request order itu
+    sendiri di open_position() — untuk market MAUPUN limit — jadi pipeline
+    TIDAK PERNAH lagi manggil set_stop_loss/set_take_profit terpisah di
+    alur open otomatis (fungsi-fungsi itu sekarang murni buat /setsl /settp
+    manual). Test ini assert set_stop_loss TIDAK dipanggil sama sekali oleh
+    execute_signal() untuk entry_type=MARKET + DRY_RUN=False, supaya kalau
+    ada yang menambahkan lagi panggilan terpisah itu (dan berpotensi bikin
+    SL/TP dobel di exchange), test ini gagal duluan.
     """
     from core.constants import ParseStatus, EntryType, Direction
 
@@ -233,16 +238,11 @@ async def test_market_signal_calls_set_stop_loss_with_correct_signature():
         pipeline._cb.execute_with_cb = _run_coro
         result = await pipeline.execute_signal(evaluation, conflict_action=None)
 
-    # Kalau bug signature-nya balik lagi, mock_sl akan gagal di-assert_called_once
-    # (TypeError terjadi SEBELUM/SAAT call, kepatch mock jadi tidak pernah
-    # ke-invoke dengan kwargs yang salah — assert kwargs eksplisit ini yang
-    # jadi jaring pengaman utama).
-    mock_sl.assert_called_once()
-    _, kwargs = mock_sl.call_args
-    assert "pair" not in kwargs, "set_stop_loss dipanggil dengan kwarg 'pair' yang tidak ada di signature aslinya"
-    assert "direction" not in kwargs, "set_stop_loss dipanggil dengan kwarg 'direction' yang tidak ada di signature aslinya"
-    assert kwargs.get("trade_id") == 42
-    assert kwargs.get("sl_price") == 0.40
+    # SL+TP sekarang atomic di open_position() — pipeline TIDAK boleh manggil
+    # set_stop_loss terpisah lagi buat market entry (itu bakal bikin SL dobel
+    # di exchange: satu preset dari order entry, satu lagi trigger order
+    # terpisah dari sini).
+    mock_sl.assert_not_called()
     assert "✅" in result or "Pipeline" in result or "selesai" in result
 
 

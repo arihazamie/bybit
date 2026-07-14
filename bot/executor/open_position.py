@@ -12,25 +12,35 @@ Tanggung jawab:
      (trip circuit breaker — di-raise ke caller, Step 19/circuit breaker Step 14)
   6. Log semua eksekusi ke database (tabel trades + event_log)
 
-Stop Loss:
-  - MARKET order: fill instan → SL dipasang terpisah setelah fill via
-    reduceOnly stop_market order (Step 13, order_manager.set_stop_loss).
-  - LIMIT order: belum fill saat order dikirim, jadi TIDAK bisa pakai
-    reduceOnly (butuh posisi yang sudah ada). SL untuk limit order WAJIB
-    di-attach atomically ke order entry itu sendiri lewat parameter unified
-    ccxt `stopLoss={"triggerPrice": ...}` (di-map ke `presetStopLossPrice`
-    Bitget — preset SL yang nempel ke order INI, aktif otomatis begitu limit
-    order fill). sl_price WAJIB ada untuk limit order — kalau kosong,
-    open_position() menolak sebelum order dikirim ke exchange.
+Stop Loss & Take Profit:
+  - MARKET dan LIMIT order SAMA-SAMA attach SL (+ TP default RR1:2, dihitung
+    dari sl_distance) secara atomic ke request order itu sendiri, lewat
+    parameter unified ccxt `stopLoss={"triggerPrice": ...}` dan
+    `takeProfit={"triggerPrice": ...}` (di-map ke `presetStopLossPrice` /
+    `presetStopSurplusPrice` Bitget — preset yang nempel ke order INI, aktif
+    otomatis begitu order fill, market maupun limit).
+  - sl_price WAJIB ada untuk KEDUA entry_type — kalau kosong, open_position()
+    menolak sebelum order dikirim ke exchange. Tidak ada lagi window "posisi
+    live tanpa SL" untuk market order — dulu SL market dipasang terpisah
+    setelah fill (reduceOnly stop_market, ada delay/celah), sekarang nempel
+    bareng entry sama seperti limit.
+  - tp_price dihitung SEKALI sebelum order dikirim (referensi harga: harga
+    limit untuk LIMIT, `risk.entry_price_used`/ticker untuk MARKET — estimasi,
+    bisa beda tipis dari fill price aktual tapi cukup untuk level TP absolut).
+    Kalau gagal dihitung, order tetap jalan tanpa TP attached — fallback ke
+    /settp manual.
+  - order_manager.set_stop_loss()/set_take_profit() (Step 13) TIDAK lagi
+    bagian dari alur open otomatis — sekarang murni dipakai command manual
+    /setsl /settp untuk update posisi yang sudah open.
 
-    PENTING — jangan pakai params.stopLossPrice (tanpa "preset") di sini:
-    ccxt.bitget menafsirkan stopLossPrice sebagai *stop-loss TRIGGER order*
-    (planType=pos_loss) yang butuh posisi yang SUDAH ADA di exchange untuk
-    di-attach via holdSide — order limit entry yang belum fill tidak punya
-    posisi sama sekali, jadi request itu selalu ditolak Bitget dengan error
-    43011 "holdSide error". `stopLoss={"triggerPrice": ...}` adalah jalur
-    yang benar: ccxt me-map ke `presetStopLossPrice`, preset SL yang
-    ditempel ke order entry itu sendiri (tidak butuh holdSide/posisi).
+    PENTING — jangan pakai params.stopLossPrice/takeProfitPrice (tanpa
+    "preset") di sini: ccxt.bitget menafsirkan itu sebagai *trigger order
+    terpisah* (planType=pos_loss/pos_profit) yang butuh posisi yang SUDAH ADA
+    di exchange untuk di-attach via holdSide — order yang belum fill tidak
+    punya posisi sama sekali, jadi request itu selalu ditolak Bitget dengan
+    error 43011 "holdSide error". `stopLoss`/`takeProfit={"triggerPrice": ...}`
+    adalah jalur yang benar: ccxt me-map ke preset field, nempel ke order
+    entry itu sendiri (tidak butuh holdSide/posisi).
 
 Scope yang TIDAK dikerjakan di sini:
   - Cancel pending order / close posisi → Step 13
@@ -203,36 +213,54 @@ async def _place_order(
     position_size: float,
     entry_price: Optional[float],
     sl_price: Optional[float],
+    tp_price: Optional[float],
     dry_run: bool,
 ) -> Dict[str, Any]:
     """
     Kirim order ke Bitget Futures via ccxt.
 
-    LIMIT order: sl_price WAJIB (>0) — di-attach ke request lewat parameter
-    unified `stopLoss` (preset SL, bukan trigger order terpisah) supaya SL
-    aktif otomatis begitu order fill (posisi belum ada saat order dikirim,
-    jadi reduceOnly stop order terpisah tidak bisa dipakai di sini — lihat
-    docstring modul).
+    MARKET & LIMIT SAMA-SAMA attach SL (+ TP kalau berhasil dihitung) secara
+    atomic ke request order itu sendiri, lewat parameter unified ccxt
+    `stopLoss={"triggerPrice": ...}` / `takeProfit={"triggerPrice": ...}`
+    (di-map ke `presetStopLossPrice` / `presetStopSurplusPrice` Bitget).
+    Preset ini bukan trigger order terpisah — dia nempel ke order entry dan
+    aktif otomatis begitu order fill, TIDAK butuh holdSide/posisi yang sudah
+    ada. Ini berlaku sama buat market maupun limit (dikonfirmasi dari
+    createOrderRequest ccxt.bitget — branch preset dipakai untuk order type
+    apapun selama bukan trigger/plan order).
+
+    Konsekuensi: sejak sekarang TIDAK ADA window "posisi live tanpa SL" buat
+    market order — SL nempel bareng fill, bukan dipasang terpisah setelah
+    fill lewat order_manager.set_stop_loss (fungsi itu sekarang cuma dipakai
+    /setsl manual, bukan bagian alur open otomatis lagi — lihat
+    signal_pipeline.py).
+
+    sl_price WAJIB (>0) untuk KEDUA entry_type — kalau kosong, order ditolak
+    di sini sebelum sempat dikirim ke exchange tanpa proteksi.
+    tp_price OPSIONAL — kalau None (gagal dihitung di caller), order tetap
+    jalan tanpa TP attached, notifikasi caller yang urus fallback /settp.
 
     Dry-run: return stub dict tanpa menyentuh exchange.
     Raise CriticalError / TransientError ke caller.
     """
     side = _ccxt_side(direction)
 
-    if entry_type == EntryType.LIMIT and (sl_price is None or sl_price <= 0):
+    if sl_price is None or sl_price <= 0:
         raise CriticalError(
-            f"[executor] Limit order untuk {symbol} tapi sl_price kosong/invalid "
-            f"({sl_price}) — SL WAJIB di-set bareng saat limit order dikirim, "
-            "parser/risk engine seharusnya sudah menangkap ini.",
+            f"[executor] {entry_type.upper()} order untuk {symbol} tapi sl_price "
+            f"kosong/invalid ({sl_price}) — SL WAJIB di-attach bareng saat order "
+            "dikirim (market maupun limit), parser/risk engine seharusnya sudah "
+            "menangkap ini.",
         )
 
     if dry_run:
         logger.info(
-            "[executor][DRY-RUN] Would place %s %s %s @ %s | size=%g%s",
+            "[executor][DRY-RUN] Would place %s %s %s @ %s | size=%g | "
+            "SL(attached)=%g%s",
             entry_type.upper(), symbol, side,
             entry_price if entry_type == EntryType.LIMIT else "market",
-            position_size,
-            f" | SL(attached)={sl_price:g}" if entry_type == EntryType.LIMIT else "",
+            position_size, sl_price,
+            f" | TP(attached)={tp_price:g}" if tp_price else " | TP=gagal dihitung",
         )
         return {
             "id": "DRY_RUN",
@@ -248,10 +276,29 @@ async def _place_order(
     try:
         exchange = await client._get_exchange()
 
+        # sl_price sudah divalidasi wajib ada di atas (guard sebelum dry_run).
+        # `stopLoss={"triggerPrice": ...}` / `takeProfit={"triggerPrice": ...}`
+        # (unified ccxt) = preset SL/TP Bitget (presetStopLossPrice /
+        # presetStopSurplusPrice) — nempel ke order INI, aktif otomatis begitu
+        # order fill, TANPA butuh posisi yang sudah ada. Berlaku sama untuk
+        # market maupun limit.
+        #
+        # JANGAN pakai params.stopLossPrice/takeProfitPrice (tanpa "preset") —
+        # ccxt.bitget menafsirkannya sebagai trigger order TERPISAH
+        # (planType=pos_loss/pos_profit) yang butuh holdSide + posisi yang
+        # SUDAH ADA di exchange. Order yang belum fill tidak punya posisi,
+        # jadi request itu selalu ditolak Bitget: error 43011 "holdSide error".
+        attach_params: Dict[str, Any] = {
+            "marginMode": "cross",
+            "productType": "USDT-FUTURES",
+            "stopLoss": {"triggerPrice": sl_price},
+        }
+        if tp_price and tp_price > 0:
+            attach_params["takeProfit"] = {"triggerPrice": tp_price}
+
         if entry_type == EntryType.MARKET:
             raw = await exchange.create_market_order(
-                symbol, side, position_size,
-                params={"marginMode": "cross", "productType": "USDT-FUTURES"},
+                symbol, side, position_size, params=attach_params,
             )
         else:
             # LIMIT order — entry_price wajib ada (validated upstream)
@@ -260,23 +307,8 @@ async def _place_order(
                     f"[executor] Limit order untuk {symbol} tapi entry_price=None — "
                     "parser/risk engine seharusnya sudah menangkap ini.",
                 )
-            # sl_price sudah divalidasi wajib ada di atas (guard sebelum dry_run).
-            # `stopLoss={"triggerPrice": ...}` (unified ccxt) = preset SL Bitget
-            # (presetStopLossPrice) — nempel ke order INI, aktif otomatis begitu
-            # limit order fill, TANPA butuh posisi yang sudah ada.
-            #
-            # JANGAN pakai params.stopLossPrice (tanpa "preset") — ccxt.bitget
-            # menafsirkannya sebagai stop-loss TRIGGER order (planType=pos_loss)
-            # yang butuh holdSide + posisi yang SUDAH ADA di exchange. Order
-            # limit entry yang belum fill tidak punya posisi, jadi request itu
-            # selalu ditolak Bitget: error 43011 "holdSide error".
             raw = await exchange.create_limit_order(
-                symbol, side, position_size, entry_price,
-                params={
-                    "marginMode": "cross",
-                    "productType": "USDT-FUTURES",
-                    "stopLoss": {"triggerPrice": sl_price},
-                },
+                symbol, side, position_size, entry_price, params=attach_params,
             )
 
         logger.info(
@@ -338,6 +370,7 @@ async def _record_trade(
     leverage_used: int,
     conflict_action: Optional[str],
     is_dry_run: bool,
+    tp_price: Optional[float] = None,
 ) -> int:
     """
     Insert record trade baru ke database.
@@ -354,23 +387,12 @@ async def _record_trade(
 
     sl_price_final = risk.sl_price or signal.stop_loss or 0.0
 
-    # Sinyal HAMPIR TIDAK PERNAH kasih harga TP (cuma entry + SL) — default
-    # ke RR 1:2 dari SL supaya TP tetap kepasang otomatis di exchange
-    # (lihat signal_pipeline.py / order_sync.py, TP dipasang begitu posisi
-    # OPEN). Kalau kebetulan sl_price/entry_price invalid (gagal hitung
-    # distance), fallback None — TP-nya nanti diset manual via /settp.
-    tp_price_default: Optional[float] = None
-    if entry_price_actual > 0 and sl_price_final > 0:
-        try:
-            tp_price_default = calculate_default_tp_price(
-                signal.direction or Direction.LONG, entry_price_actual, sl_price_final,
-            )
-        except ValueError as exc:
-            logger.warning(
-                "[executor] Gagal hitung default TP RR2 untuk %s: %s — "
-                "TP dibiarkan kosong, set manual via /settp.",
-                signal.pair_normalized or signal.pair_raw, exc,
-            )
+    # tp_price di sini adalah nilai yang SAMA dengan yang di-attach ke order
+    # (dihitung sekali di open_position(), sebelum order dikirim) — bukan
+    # dihitung ulang, supaya DB selalu konsisten dengan preset TP yang live
+    # di exchange. None kalau caller gagal hitung (SL/entry invalid) — TP
+    # nanti diset manual via /settp.
+    tp_price_default = tp_price
 
     trade_id = await async_create_trade(
         pair=signal.pair_normalized or signal.pair_raw or "",
@@ -482,10 +504,47 @@ async def open_position(
             failure_reason="limit_order_missing_sl_price",
             is_critical=False,
         )
+    if entry_type == EntryType.MARKET and sl_price <= 0:
+        # Sama seperti limit — MARKET sekarang juga WAJIB attach SL+TP
+        # atomically di request order (params.stopLoss/takeProfit, lihat
+        # _place_order). Tanpa sl_price, tidak ada dasar hitung TP RR1:2,
+        # dan order akan naked kalau tetap dikirim — tolak di sini.
+        return ExecutionResult(
+            success=False,
+            pair=pair,
+            failure_reason="market_order_missing_sl_price",
+            is_critical=False,
+        )
 
     leverage_used = _to_int_leverage(safety.leverage_safe)
     position_size = risk.position_size
     entry_price = signal.entry_price if entry_type == EntryType.LIMIT else None
+
+    # ── TP default RR 1:2, dihitung SEKALI di sini, dipakai buat attach
+    # atomically ke order (MARKET & LIMIT) DAN buat record DB (_record_trade)
+    # — supaya angka TP yang nempel di exchange selalu sama dengan yang
+    # tercatat di DB (satu sumber kebenaran, bukan dihitung dua kali).
+    #
+    # Referensi harga buat estimasi TP:
+    #   - LIMIT  -> signal.entry_price (harga limit, exact)
+    #   - MARKET -> risk.entry_price_used (ticker saat risk engine Step 9
+    #     jalan - estimasi, bisa beda sedikit dari fill price aktual, tapi
+    #     cukup buat hitung level TP absolut; tetap jauh lebih aman
+    #     daripada tanpa TP sama sekali sampai fill event datang)
+    tp_price_ref = entry_price if entry_type == EntryType.LIMIT else risk.entry_price_used
+    tp_price: Optional[float] = None
+    if tp_price_ref and tp_price_ref > 0 and sl_price > 0:
+        try:
+            tp_price = calculate_default_tp_price(
+                direction, tp_price_ref, sl_price,
+            )
+        except ValueError as exc:
+            logger.warning(
+                "[executor] Gagal hitung default TP RR2 pre-order untuk %s: %s "
+                "- order tetap jalan TANPA TP attached, set manual via /settp "
+                "setelah fill.",
+                pair, exc,
+            )
 
     notes: list = []
     if safety.leverage_adjusted:
@@ -534,7 +593,7 @@ async def open_position(
     try:
         order_raw = await _place_order(
             client, pair, direction, entry_type,
-            position_size, entry_price, sl_price, is_dry,
+            position_size, entry_price, sl_price, tp_price, is_dry,
         )
     except CriticalError as exc:
         msg = f"Critical error saat place order {pair}: {exc}"
@@ -571,7 +630,7 @@ async def open_position(
         trade_id = await _record_trade(
             signal, risk, safety, order_raw,
             entry_price_actual, leverage_used,
-            conflict_action, is_dry,
+            conflict_action, is_dry, tp_price,
         )
     except Exception as exc:
         # DB error bukan alasan batalkan trade yang sudah dikirim ke exchange
