@@ -35,6 +35,8 @@ from db.crud.settings import is_bot_paused, set_bot_paused
 from db.crud.trades import (
     async_get_open_trade_for_pair,
     async_get_open_trades,
+    async_get_filled_open_trade_for_pair,
+    async_get_filled_open_trades,
     async_get_pending_trade_for_pair,
     async_get_pending_trades,
     async_update_trade_entry,
@@ -237,12 +239,19 @@ async def cmd_setsl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     await _reconcile_before_action()
-    trade = await async_get_open_trade_for_pair(pair)
+    trade = await async_get_filled_open_trade_for_pair(pair)
     if not trade:
+        pending = await async_get_pending_trade_for_pair(pair)
+        if pending:
+            await _send(
+                update,
+                f"❌ <code>{pair}</code> masih <b>PENDING</b> (order belum fill di exchange).\n"
+                f"SL belum bisa diset — belum ada posisi live untuk dipasangi stop order.\n"
+                f"SL otomatis dipasang begitu order fill.",
+            )
+            return
         await _send(update, f"❌ Tidak ada posisi <b>OPEN</b> untuk <code>{pair}</code>.")
         return
-
-    old_sl  = trade.get("sl_price")
     old_str = f"{old_sl:g}" if old_sl else "tidak ada"
     direction = (trade.get("direction") or "?").upper()
     entry     = trade.get("entry_price")
@@ -320,8 +329,16 @@ async def cmd_close(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     pair  = context.args[0].upper()
     await _reconcile_before_action()
-    trade = await async_get_open_trade_for_pair(pair)
+    trade = await async_get_filled_open_trade_for_pair(pair)
     if not trade:
+        pending = await async_get_pending_trade_for_pair(pair)
+        if pending:
+            await _send(
+                update,
+                f"❌ <code>{pair}</code> masih <b>PENDING</b>, belum ada posisi live di exchange.\n"
+                f"Gunakan <code>/cancel {pair}</code> untuk batalkan order pending.",
+            )
+            return
         await _send(update, f"❌ Tidak ada posisi <b>OPEN</b> untuk <code>{pair}</code>.")
         return
 
@@ -349,7 +366,7 @@ async def cmd_close(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 @authorized
 async def cmd_closeall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _reconcile_before_action()
-    open_trades = await async_get_open_trades()
+    open_trades = await async_get_filled_open_trades()
     if not open_trades:
         await _send(update, "ℹ️ Tidak ada posisi open saat ini.")
         return

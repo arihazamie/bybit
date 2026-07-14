@@ -162,6 +162,31 @@ def get_open_trade_for_pair(pair: str) -> Optional[dict]:
     return row_to_dict(row)
 
 
+def get_filled_open_trades() -> list[dict]:
+    """
+    Ambil trade yang BENAR-BENAR open (order sudah fill, posisi live di exchange).
+    Beda dengan get_open_trades() yang juga ikutkan status 'pending' (limit
+    order belum fill, belum ada posisi di exchange) — dipakai khusus untuk
+    aksi yang menyentuh exchange (setsl, close, closeall) supaya tidak
+    salah target ke pending order yang belum punya posisi live.
+    """
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM trades WHERE status = 'open' ORDER BY created_at DESC",
+        ).fetchall()
+    return rows_to_dicts(rows)
+
+
+def get_filled_open_trade_for_pair(pair: str) -> Optional[dict]:
+    """Versi strict-open (status = 'open' saja) dari get_open_trade_for_pair."""
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM trades WHERE pair = ? AND status = 'open' ORDER BY created_at DESC LIMIT 1",
+            (pair,),
+        ).fetchone()
+    return row_to_dict(row)
+
+
 def get_closed_trades(limit: int = 50) -> list[dict]:
     """
     Ambil trade yang sudah ditutup, terbaru dulu.
@@ -508,6 +533,14 @@ async def async_get_open_trades() -> list[dict]:
 
 async def async_get_open_trade_for_pair(pair: str) -> Optional[dict]:
     return await _run_in_executor(get_open_trade_for_pair, pair)
+
+
+async def async_get_filled_open_trades() -> list[dict]:
+    return await _run_in_executor(get_filled_open_trades)
+
+
+async def async_get_filled_open_trade_for_pair(pair: str) -> Optional[dict]:
+    return await _run_in_executor(get_filled_open_trade_for_pair, pair)
 
 
 async def async_get_closed_trades(limit: int = 50) -> list[dict]:

@@ -25,7 +25,7 @@ import logging
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
-from telegram.error import BadRequest
+from telegram.error import BadRequest, TimedOut
 from telegram.ext import ContextTypes
 
 from bot.control_bot.auth import authorized
@@ -45,7 +45,7 @@ from bot.control_bot.menu.keyboards import (
     main_menu_kb, pair_pick_kb, pos_menu_kb, risk_menu_kb,
 )
 from bot.control_bot.menu.state import AwaitingInput, menu_state
-from db.crud.trades import async_get_open_trades, async_get_pending_trades
+from db.crud.trades import async_get_filled_open_trades, async_get_open_trades, async_get_pending_trades
 
 logger = logging.getLogger(__name__)
 
@@ -81,11 +81,11 @@ _TEXT_INPUT_ACTIONS = {
 
 # Aksi pilih-pair dulu → (fungsi cmd_* lama, sumber daftar pair, prompt setelah pair dipilih)
 _PAIR_PICK_ACTIONS = {
-    "settp":    ("open",    cmd_settp,    "Kirim <b>harga TP</b> untuk <code>{pair}</code>."),
-    "setsl":    ("open",    cmd_setsl,    "Kirim <b>harga SL</b> untuk <code>{pair}</code>."),
-    "setentry": ("open",    cmd_setentry, "Kirim <b>harga entry</b> baru untuk <code>{pair}</code>."),
-    "close":    ("open",    cmd_close,    None),   # zero-arg lanjutan setelah pair dipilih
-    "cancel":   ("pending", cmd_cancel,   None),
+    "settp":    ("open",        cmd_settp,    "Kirim <b>harga TP</b> untuk <code>{pair}</code>."),
+    "setsl":    ("open_only",   cmd_setsl,    "Kirim <b>harga SL</b> untuk <code>{pair}</code>."),
+    "setentry": ("open",        cmd_setentry, "Kirim <b>harga entry</b> baru untuk <code>{pair}</code>."),
+    "close":    ("open_only",   cmd_close,    None),   # zero-arg lanjutan setelah pair dipilih
+    "cancel":   ("pending",     cmd_cancel,   None),
 }
 
 _MENU_SCREENS = {
@@ -117,12 +117,17 @@ async def _cancel_prompt_kb(return_to: str) -> InlineKeyboardMarkup:
 
 async def _prompt_pair_pick(update: Update, action: str) -> None:
     source, _, _ = _PAIR_PICK_ACTIONS[action]
-    trades = await (async_get_open_trades() if source == "open" else async_get_pending_trades())
+    if source == "open_only":
+        trades = await async_get_filled_open_trades()
+    elif source == "open":
+        trades = await async_get_open_trades()
+    else:
+        trades = await async_get_pending_trades()
     pairs = sorted({t["pair"] for t in trades})
 
     query = update.callback_query
     if not pairs:
-        label = "posisi open" if source == "open" else "order pending"
+        label = "posisi open" if source in ("open", "open_only") else "order pending"
         await query.edit_message_text(
             f"ℹ️ Tidak ada {label} saat ini.",
             reply_markup=await _cancel_prompt_kb("menu:pos"),
@@ -160,7 +165,10 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     # Navigasi menu manapun membatalkan input teks yang sedang ditunggu.
     menu_state.clear(chat_id)
 
-    await query.answer()
+    try:
+        await query.answer()
+    except TimedOut:
+        logger.warning("query.answer() timeout, lanjut proses callback: %s", data)
 
     parts = data.split(":", 3)  # ["menu", category, action?, extra?]
     if len(parts) < 2:
