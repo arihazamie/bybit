@@ -115,6 +115,7 @@ class ExecutionResult:
     order_id: Optional[str] = None
     is_dry_run: bool = False
     entry_type: Optional[str] = None
+    direction: Optional[str] = None
 
     # Leverage yang dipakai (setelah safety adjustment Step 10)
     leverage_used: Optional[float] = None
@@ -124,6 +125,12 @@ class ExecutionResult:
     entry_price_actual: Optional[float] = None   # fill price (market) atau limit price
     position_size: Optional[float] = None
     margin_used: Optional[float] = None
+
+    # Proteksi + risk metrics — buat notifikasi institutional-style
+    sl_price: Optional[float] = None
+    tp_price: Optional[float] = None
+    risk_amount_usd: Optional[float] = None
+    risk_percent_used: Optional[float] = None
 
     failure_reason: Optional[str] = None
     is_critical: bool = False                    # True → trip circuit breaker
@@ -137,6 +144,11 @@ class ExecutionResult:
 
 def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _utcnow_display() -> str:
+    """Timestamp ringkas buat footer notifikasi: 'YYYY-MM-DD HH:MM:SS UTC'."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
 def _ccxt_side(direction: str) -> str:
@@ -667,11 +679,16 @@ async def open_position(
         order_id=order_id if order_id and order_id != "DRY_RUN" else None,
         is_dry_run=is_dry,
         entry_type=entry_type,
+        direction=direction,
         leverage_used=float(leverage_used),
         leverage_adjusted=safety.leverage_adjusted,
         entry_price_actual=entry_price_actual,
         position_size=position_size,
         margin_used=risk.margin_needed,
+        sl_price=sl_price,
+        tp_price=tp_price,
+        risk_amount_usd=risk.risk_amount_usd,
+        risk_percent_used=risk.risk_percent_used,
         notes=notes,
     )
 
@@ -685,33 +702,113 @@ async def open_position(
     return result
 
 
-# ── Notifikasi ───────────────────────────────────────────────────────────────
+# ── Notifikasi (institutional-style) ──────────────────────────────────────
+
+_DIVIDER = "▬" * 22
+
+
+def _pct_distance(reference: float, target: float) -> str:
+    """% jarak target dari reference, buat display SL/TP distance."""
+    if reference == 0:
+        return "n/a"
+    pct = (target - reference) / reference * 100
+    return f"{pct:+.2f}%"
+
+
+def _fmt_num(value: Optional[float], decimals: int = 2) -> str:
+    if value is None:
+        return "—"
+    return f"{value:,.{decimals}f}"
+
+
+def _fmt_price(value: Optional[float]) -> str:
+    if value is None:
+        return "—"
+    return f"{value:g}"
+
+
+def _risk_reward_ratio(entry: float, sl: float, tp: Optional[float]) -> str:
+    if tp is None:
+        return "—"
+    sl_dist = abs(entry - sl)
+    tp_dist = abs(tp - entry)
+    if sl_dist == 0:
+        return "—"
+    return f"1 : {tp_dist / sl_dist:.2f}"
+
 
 def format_execution_notification(result: ExecutionResult) -> str:
-    """Format teks notifikasi Telegram untuk hasil eksekusi open position."""
+    """
+    Notifikasi eksekusi entry — format institutional/desk-style: header
+    status, blok proteksi (entry/SL/TP/R:R), blok sizing (size/margin/
+    leverage/risk), footer (trade id + timestamp UTC). HTML parse mode
+    (Telegram) — monospace lewat <code> buat angka biar sejajar/gampang
+    dibaca cepat, konsisten dengan gaya notifikasi desk trading.
+    """
     if not result.success:
-        critical_tag = "🔴 CRITICAL" if result.is_critical else "⚠️"
+        header = "🔴 <b>ENTRY REJECTED — CRITICAL</b>" if result.is_critical else "🟠 <b>ENTRY REJECTED</b>"
         return (
-            f"{critical_tag} Gagal buka posisi {result.pair}\n"
-            f"Alasan: {result.failure_reason}"
+            f"{header}\n"
+            f"{_DIVIDER}\n"
+            f"<b>Pair</b>      <code>{result.pair or '—'}</code>\n"
+            f"<b>Reason</b>    {result.failure_reason or 'unknown'}\n"
+            f"{_DIVIDER}\n"
+            f"<i>{_utcnow_display()}</i>"
         )
 
-    dry_tag = "🔵 [DRY-RUN] " if result.is_dry_run else ""
-    entry_type_label = (
-        "⏳ Limit order" if result.entry_type == EntryType.LIMIT else "🚀 Market order"
-    )
-    lines = [
-        f"{dry_tag}✅ {entry_type_label} dikirim: {result.pair}",
-        f"• Entry  : {result.entry_price_actual:g}" if result.entry_price_actual else "",
-        f"• Size   : {result.position_size:g}" if result.position_size else "",
-        f"• Margin : ~{result.margin_used:.2f} USDT" if result.margin_used else "",
-        f"• Leverage: {int(result.leverage_used)}x" if result.leverage_used else "",
-    ]
-    if result.leverage_adjusted:
-        lines.append("📉 Leverage diturunkan otomatis (buffer liquidation)")
-    for note in result.notes:
-        lines.append(f"ℹ️ {note}")
-    if result.trade_id:
-        lines.append(f"🗂️ Trade ID: {result.trade_id}")
+    is_long = result.direction == Direction.LONG
+    side_badge = "🟢 LONG" if is_long else "🔴 SHORT"
+    type_badge = "MKT" if result.entry_type == EntryType.MARKET else "LMT"
+    dry_prefix = "🔵 <b>[SIMULATION]</b> " if result.is_dry_run else ""
 
-    return "\n".join(l for l in lines if l)
+    entry = result.entry_price_actual or 0.0
+    sl = result.sl_price
+    tp = result.tp_price
+
+    lines = [
+        f"{dry_prefix}✅ <b>POSITION OPENED</b>  <code>{result.pair}</code>",
+        f"<b>{side_badge}</b>  ·  {type_badge}  ·  Cross {int(result.leverage_used)}x" if result.leverage_used else f"<b>{side_badge}</b>  ·  {type_badge}",
+        _DIVIDER,
+        f"<b>Entry</b>        <code>{_fmt_price(entry)}</code>",
+    ]
+
+    if sl:
+        lines.append(
+            f"<b>Stop Loss</b>   <code>{_fmt_price(sl)}</code>  "
+            f"({_pct_distance(entry, sl)})"
+        )
+    if tp:
+        lines.append(
+            f"<b>Take Profit</b> <code>{_fmt_price(tp)}</code>  "
+            f"({_pct_distance(entry, tp)})"
+        )
+    if sl:
+        lines.append(f"<b>R : R</b>        {_risk_reward_ratio(entry, sl, tp)}")
+
+    lines.append(_DIVIDER)
+    lines.append(f"<b>Size</b>         <code>{_fmt_price(result.position_size)}</code>")
+    if result.margin_used is not None:
+        lines.append(f"<b>Margin</b>       <code>{_fmt_num(result.margin_used)} USDT</code>")
+    if result.risk_amount_usd is not None:
+        risk_pct = (
+            f" ({result.risk_percent_used:.2f}%)"
+            if result.risk_percent_used is not None
+            else ""
+        )
+        lines.append(f"<b>Risk</b>         <code>{_fmt_num(result.risk_amount_usd)} USDT</code>{risk_pct}")
+
+    if result.leverage_adjusted:
+        lines.append(_DIVIDER)
+        lines.append("📉 <i>Leverage auto-adjusted (liquidation buffer)</i>")
+    for note in result.notes:
+        if "Leverage diturunkan" in note:
+            continue  # sudah direpresentasikan di baris leverage_adjusted di atas
+        lines.append(f"ℹ️ <i>{note}</i>")
+
+    lines.append(_DIVIDER)
+    footer = f"Trade #{result.trade_id}" if result.trade_id else "Trade #—"
+    footer += f" · {result.order_id}" if result.order_id else ""
+    lines.append(f"<code>{footer}</code>")
+    lines.append(f"<i>{_utcnow_display()}</i>")
+
+    return "\n".join(lines)

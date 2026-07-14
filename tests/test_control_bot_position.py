@@ -72,6 +72,19 @@ def _pending_trade(pair: str = "BTC/USDT:USDT", trade_id: int = 2) -> dict:
     }
 
 
+@pytest.fixture(autouse=True)
+def _mock_reconcile_on_startup():
+    """Semua command posisi (setsl/settp/setentry/close/closeall/pending/cancel)
+    sekarang jalanin live reconciliation dulu (bot/control_bot/commands/position.py
+    baris ~65-66) sebelum aksi. Tanpa mock ini, test bakal coba hit exchange
+    beneran (network diblokir sandbox) dan nunggu sampai timeout 8 detik."""
+    with patch(
+        "bot.executor.order_sync.reconcile_on_startup",
+        new_callable=AsyncMock,
+    ):
+        yield
+
+
 def _store_pending(action: str, **payload_kwargs) -> str:
     """Helper test: simpan payload langsung ke pending_store (tanpa TTL/timeout)
     supaya bisa dipanggil dari handle_position_callback seperti alur asli."""
@@ -116,7 +129,9 @@ async def test_settp_no_open_trade():
     from bot.control_bot.commands.position import cmd_settp
     update, ctx = _make_update(), _make_context(["BTC/USDT:USDT", "70000"])
     with patch(AUTH_PATCH, return_value=ALLOWED_IDS), \
-         patch("bot.control_bot.commands.position.async_get_open_trade_for_pair",
+         patch("bot.control_bot.commands.position.async_get_filled_open_trade_for_pair",
+               new_callable=AsyncMock, return_value=None), \
+         patch("bot.control_bot.commands.position.async_get_pending_trade_for_pair",
                new_callable=AsyncMock, return_value=None):
         await cmd_settp(update, ctx)
     text = update.message.reply_text.call_args[0][0]
@@ -129,7 +144,7 @@ async def test_settp_shows_confirm_keyboard():
     update, ctx = _make_update(), _make_context(["BTC/USDT:USDT", "70000"])
     trade = _open_trade()
     with patch(AUTH_PATCH, return_value=ALLOWED_IDS), \
-         patch("bot.control_bot.commands.position.async_get_open_trade_for_pair",
+         patch("bot.control_bot.commands.position.async_get_filled_open_trade_for_pair",
                new_callable=AsyncMock, return_value=trade):
         await cmd_settp(update, ctx)
     kwargs = update.message.reply_text.call_args[1]
@@ -144,7 +159,7 @@ async def test_setsl_shows_confirm():
     update, ctx = _make_update(), _make_context(["BTC/USDT:USDT", "63000"])
     trade = _open_trade()
     with patch(AUTH_PATCH, return_value=ALLOWED_IDS), \
-         patch("bot.control_bot.commands.position.async_get_open_trade_for_pair",
+         patch("bot.control_bot.commands.position.async_get_filled_open_trade_for_pair",
                new_callable=AsyncMock, return_value=trade):
         await cmd_setsl(update, ctx)
     kwargs = update.message.reply_text.call_args[1]
@@ -187,7 +202,9 @@ async def test_close_no_trade():
     from bot.control_bot.commands.position import cmd_close
     update, ctx = _make_update(), _make_context(["BTC/USDT:USDT"])
     with patch(AUTH_PATCH, return_value=ALLOWED_IDS), \
-         patch("bot.control_bot.commands.position.async_get_open_trade_for_pair",
+         patch("bot.control_bot.commands.position.async_get_filled_open_trade_for_pair",
+               new_callable=AsyncMock, return_value=None), \
+         patch("bot.control_bot.commands.position.async_get_pending_trade_for_pair",
                new_callable=AsyncMock, return_value=None):
         await cmd_close(update, ctx)
     text = update.message.reply_text.call_args[0][0]
@@ -200,7 +217,7 @@ async def test_close_shows_confirm():
     update, ctx = _make_update(), _make_context(["BTC/USDT:USDT"])
     trade = _open_trade()
     with patch(AUTH_PATCH, return_value=ALLOWED_IDS), \
-         patch("bot.control_bot.commands.position.async_get_open_trade_for_pair",
+         patch("bot.control_bot.commands.position.async_get_filled_open_trade_for_pair",
                new_callable=AsyncMock, return_value=trade):
         await cmd_close(update, ctx)
     kwargs = update.message.reply_text.call_args[1]
@@ -214,7 +231,7 @@ async def test_closeall_empty():
     from bot.control_bot.commands.position import cmd_closeall
     update, ctx = _make_update(), _make_context()
     with patch(AUTH_PATCH, return_value=ALLOWED_IDS), \
-         patch("bot.control_bot.commands.position.async_get_open_trades",
+         patch("bot.control_bot.commands.position.async_get_filled_open_trades",
                new_callable=AsyncMock, return_value=[]):
         await cmd_closeall(update, ctx)
     text = update.message.reply_text.call_args[0][0]
@@ -227,7 +244,7 @@ async def test_closeall_shows_confirm():
     update, ctx = _make_update(), _make_context()
     trades = [_open_trade("BTC/USDT:USDT", 1), _open_trade("ETH/USDT:USDT", 2)]
     with patch(AUTH_PATCH, return_value=ALLOWED_IDS), \
-         patch("bot.control_bot.commands.position.async_get_open_trades",
+         patch("bot.control_bot.commands.position.async_get_filled_open_trades",
                new_callable=AsyncMock, return_value=trades):
         await cmd_closeall(update, ctx)
     kwargs = update.message.reply_text.call_args[1]
@@ -417,8 +434,9 @@ async def test_callback_confirm_settp():
     key = _store_pending("settp", pair="BTC/USDT:USDT", trade_id=1, price=70000.0)
     update = _make_callback(f"pos:{key}:y")
     ctx = _make_context()
-    with patch("bot.control_bot.commands.position.async_update_trade_tp",
-               new_callable=AsyncMock, return_value=True):
+    with patch("bot.control_bot.commands.position.set_take_profit",
+               new_callable=AsyncMock,
+               return_value=MagicMock(success=True, is_dry_run=False, notes=[], failure_reason=None)):
         await handle_position_callback(update, ctx)
     text = update.callback_query.edit_message_text.call_args[0][0]
     assert "Take Profit" in text

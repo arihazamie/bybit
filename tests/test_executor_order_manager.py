@@ -115,6 +115,19 @@ def _mock_trade(
     }
 
 
+def _mock_positions(pair="ETH/USDT:USDT", size=0.05, side="long"):
+    """Live position fixture buat _fetch_live_position_or_none() — tanpa ini
+    client.fetch_positions([pair]) gak ada posisi match, live check dianggap
+    gagal/tidak ketemu."""
+    return [{"symbol": pair, "contracts": size, "side": side}]
+
+
+def _mock_client_with_positions(pair="ETH/USDT:USDT", size=0.05, side="long"):
+    client = MagicMock()
+    client.fetch_positions = AsyncMock(return_value=_mock_positions(pair, size, side))
+    return client
+
+
 @pytest.mark.asyncio
 async def test_set_stop_loss_dry_run():
     trade = _mock_trade()
@@ -122,7 +135,7 @@ async def test_set_stop_loss_dry_run():
         patch("bot.executor.order_manager.async_get_trade_by_id", new_callable=AsyncMock, return_value=trade),
         patch("bot.executor.order_manager.async_update_trade_sl", new_callable=AsyncMock),
         patch("bot.executor.order_manager.async_log_event", new_callable=AsyncMock),
-        patch("bot.executor.order_manager.get_rest_client", return_value=MagicMock()),
+        patch("bot.executor.order_manager.get_rest_client", return_value=_mock_client_with_positions()),
     ):
         result = await set_stop_loss(1, sl_price=2900.0, dry_run=True)
 
@@ -152,6 +165,7 @@ async def test_set_stop_loss_uses_position_scoped_tpsl_order():
     })
     mock_client = MagicMock()
     mock_client._get_exchange = AsyncMock(return_value=mock_exchange)
+    mock_client.fetch_positions = AsyncMock(return_value=_mock_positions("ETH/USDT:USDT", 0.05, "long"))
 
     with (
         patch("bot.executor.order_manager.async_get_trade_by_id", new_callable=AsyncMock, return_value=trade),
@@ -197,6 +211,7 @@ async def test_set_stop_loss_uses_valid_bitget_order_type():
     })
     mock_client = MagicMock()
     mock_client._get_exchange = AsyncMock(return_value=mock_exchange)
+    mock_client.fetch_positions = AsyncMock(return_value=_mock_positions("ETH/USDT:USDT", 0.05, "long"))
 
     with (
         patch("bot.executor.order_manager.async_get_trade_by_id", new_callable=AsyncMock, return_value=trade),
@@ -232,6 +247,7 @@ async def test_set_stop_loss_cancels_old_order_before_placing_new():
     mock_exchange.create_order = AsyncMock(return_value={"id": "NEW_SL_456"})
     mock_client = MagicMock()
     mock_client._get_exchange = AsyncMock(return_value=mock_exchange)
+    mock_client.fetch_positions = AsyncMock(return_value=_mock_positions("ETH/USDT:USDT", 0.05, "long"))
 
     mock_update_sl = AsyncMock()
 
@@ -269,6 +285,7 @@ async def test_set_stop_loss_old_order_missing_does_not_block_new_sl():
     mock_exchange.create_order = AsyncMock(return_value={"id": "NEW_SL_789"})
     mock_client = MagicMock()
     mock_client._get_exchange = AsyncMock(return_value=mock_exchange)
+    mock_client.fetch_positions = AsyncMock(return_value=_mock_positions("ETH/USDT:USDT", 0.05, "long"))
 
     with (
         patch("bot.executor.order_manager.async_get_trade_by_id", new_callable=AsyncMock, return_value=trade),
@@ -373,7 +390,7 @@ async def test_close_position_dry_run_long():
         patch("bot.executor.order_manager.async_get_trade_by_id", new_callable=AsyncMock, return_value=trade),
         patch("bot.executor.order_manager.async_close_trade", new_callable=AsyncMock),
         patch("bot.executor.order_manager.async_log_event", new_callable=AsyncMock),
-        patch("bot.executor.order_manager.get_rest_client", return_value=MagicMock()),
+        patch("bot.executor.order_manager.get_rest_client", return_value=_mock_client_with_positions()),
     ):
         result = await close_position(1, close_reason=CloseReason.MANUAL, dry_run=True)
 
@@ -432,7 +449,10 @@ async def test_close_all_dry_run_multiple():
         _mock_trade(trade_id=2, pair="BTC/USDT:USDT"),
     ]
     mock_client = AsyncMock()
-    mock_client.fetch_positions = AsyncMock(return_value=[])
+    mock_client.fetch_positions = AsyncMock(return_value=(
+        _mock_positions("ETH/USDT:USDT", 0.05, "long")
+        + _mock_positions("BTC/USDT:USDT", 0.05, "long")
+    ))
 
     with (
         patch("bot.executor.order_manager.async_get_open_trades", new_callable=AsyncMock, return_value=trades),

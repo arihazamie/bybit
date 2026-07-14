@@ -420,6 +420,12 @@ async def set_stop_loss(
     db_position_size = _safe_float(trade.get("position_size"))
     old_sl_order_id = trade.get("sl_order_id")
 
+    if db_position_size <= 0:
+        return OrderManagementResult(
+            success=False, operation="set_sl", pair=pair, trade_id=trade_id,
+            failure_reason="invalid_position_size: position_size=0", is_critical=False,
+        )
+
     # Live posisi TEPAT SEBELUM place order — bukan DB, yang bisa basi
     # (posisi sudah closed manual di exchange tapi belum ke-sync ke DB).
     live_pos = await _fetch_live_position_or_none(client, pair)
@@ -1215,6 +1221,12 @@ async def close_position(
 
     pair = trade["pair"]
     db_position_size = _safe_float(trade.get("position_size"))
+
+    if db_position_size <= 0:
+        return OrderManagementResult(
+            success=False, operation="close_position", pair=pair, trade_id=trade_id,
+            failure_reason="invalid_position_size: position_size=0", is_critical=False,
+        )
 
     live_pos = await _fetch_live_position_or_none(client, pair)
     if live_pos is None:

@@ -144,19 +144,20 @@ def test_notification_failure_transient():
         is_critical=False,
     )
     text = format_execution_notification(r)
-    assert "⚠️" in text
+    assert "ENTRY REJECTED" in text
+    assert "CRITICAL" not in text  # non-critical transient, beda tag dari critical
     assert "Timeout" in text
 
 
 def test_notification_success_dry_run():
     r = ExecutionResult(
         success=True, pair="ETH/USDT:USDT",
-        trade_id=42, is_dry_run=True,
+        trade_id=42, is_dry_run=True, direction=Direction.LONG,
         leverage_used=20.0, leverage_adjusted=False,
         entry_price_actual=3000.0, position_size=0.05, margin_used=15.0,
     )
     text = format_execution_notification(r)
-    assert "DRY-RUN" in text
+    assert "SIMULATION" in text
     assert "ETH/USDT:USDT" in text
     assert "42" in text  # trade_id
 

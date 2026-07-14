@@ -270,6 +270,7 @@ async def cmd_setsl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
         await _send(update, f"❌ Tidak ada posisi <b>OPEN</b> untuk <code>{pair}</code>.")
         return
+    old_sl = trade.get("sl_price")
     old_str = f"{old_sl:g}" if old_sl else "tidak ada"
     direction = (trade.get("direction") or "?").upper()
     entry     = trade.get("entry_price")
