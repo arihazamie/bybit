@@ -79,7 +79,7 @@ from exchange.bitget.rest_client import BitgetRestClient, get_rest_client
 from exchange.bitget.ws_client import OrderEvent, PositionEvent
 from notifications.notifier import notify
 
-from bot.executor.order_manager import set_stop_loss, set_take_profit
+from bot.executor.order_manager import set_stop_loss
 
 logger = get_logger(__name__)
 
@@ -310,33 +310,24 @@ async def _handle_order_filled(event: OrderEvent) -> None:
         "[order_sync] Trade #%s (%s) → OPEN (fill), order_id=%s source=%s",
         trade["id"], event.symbol, event.order_id or "-", event.source,
     )
-    # NB: SL TIDAK diset di sini lagi — sekarang dipasang LANGSUNG saat entry
-    # order dikirim (lihat signal_pipeline.py, dieksekusi bersamaan dengan
-    # entry, tidak menunggu fill event ini). Kalau di-set lagi di sini juga,
-    # hasilnya DOBEL SL order untuk trade yang sama. Handler ini sekarang
-    # murni update status + notifikasi informasi fill.
-    #
-    # TP beda ceritanya: TPSL take-profit BUTUH posisi yang sudah live
-    # (holdSide terikat posisi, sama seperti SL trigger order) — makanya
-    # baru bisa dipasang DI SINI, setelah status trade jadi OPEN, bukan
-    # bareng entry order seperti SL preset. tp_price sudah terisi default
-    # RR1:2 sejak trade dibuat (lihat open_position._record_trade) kalau
-    # sinyal tidak kasih TP eksplisit.
-    tp_note = ""
+    # NB: SL & TP TIDAK diset di sini lagi — dua-duanya sekarang dipasang
+    # LANGSUNG saat entry order dikirim, lewat params.stopLoss/takeProfit
+    # unified ccxt (preset presetStopLossPrice/presetStopSurplusPrice —
+    # lihat open_position.py, dieksekusi atomic bareng entry, tidak nunggu
+    # fill event ini). Kalau TP di-set LAGI di sini pakai set_take_profit()
+    # (holdSide route), hasilnya order TPSL kedua yang bentrok dengan preset
+    # TP yang sudah nempel dari entry — exchange tolak dengan
+    # {"code":"43011","msg":"...holdSide error"} karena posisi itu udah
+    # punya preset take-profit aktif, gak bisa dobel. Root cause bug TP
+    # gagal dipasang pas fill — comment lama di sini salah (klaim TP belum
+    # nempel di entry), padahal TP SAMA persis mekanismenya kayak SL
+    # preset. Handler ini sekarang murni update status + notifikasi info
+    # fill, gak nyentuh exchange lagi buat TP.
     tp_price = trade.get("tp_price")
-    if tp_price:
-        try:
-            tp_result = await set_take_profit(trade["id"], tp_price, rest_client=get_rest_client())
-        except Exception as exc:
-            logger.exception(
-                "[order_sync] set_take_profit meledak tak terduga untuk trade #%s", trade["id"],
-            )
-            tp_note = f"\n⚠️ TP @ <code>{tp_price:g}</code> gagal dipasang: error tak terduga ({exc})."
-        else:
-            if tp_result.success:
-                tp_note = f"\n🎯 TP @ <code>{tp_price:g}</code> terpasang otomatis (RR default kalau sinyal tanpa TP)."
-            else:
-                tp_note = f"\n⚠️ TP @ <code>{tp_price:g}</code> gagal dipasang: {tp_result.failure_reason}. Set manual via /settp."
+    tp_note = (
+        f"\n🎯 TP @ <code>{tp_price:g}</code> sudah terpasang sejak entry dikirim."
+        if tp_price else ""
+    )
 
     await notify(
         f"✅ <b>LIMIT ORDER FILLED</b>\n\n"
