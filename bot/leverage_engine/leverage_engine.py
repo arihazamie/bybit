@@ -690,51 +690,49 @@ async def run_leverage_safety_check(
         )
         return result
 
-    # ── 5. Leverage awal tidak aman — cari leverage yang aman ───────────
+    # ── 5. Leverage awal tidak aman ───────────────────────────────────
+    # PENTING (akun mode CROSS): maintenance margin posisi baru = notional *
+    # mm_rate, TIDAK bergantung leverage_used (lihat _calculate_new_position_mm)
+    # — di cross, seluruh equity akun jadi collateral bersama; leverage per
+    # simbol hanya mengubah margin_needed/free margin, BUKAN jarak akun ke
+    # liquidation untuk position_size yang tetap. Konsekuensinya: kalau
+    # proyeksi di initial_leverage sudah tidak aman, proyeksi TETAP tidak
+    # aman di leverage berapa pun (termasuk 1x) — tidak ada "leverage aman"
+    # untuk dicari (dulu di sini ada binary search _find_safe_leverage yang
+    # secara matematis selalu berakhir di initial_leverage atau MIN_LEVERAGE
+    # tanpa pernah menemukan titik tengah — dead code, sudah dihapus).
+    # Satu-satunya cara sesungguhnya memperbesar buffer liquidation-vs-SL
+    # adalah memperkecil position_size (risk_amount lebih kecil / sl_distance
+    # lebih lebar) — bukan leverage.
     logger.info(
         "[leverage_engine] %s | leverage=%dx TIDAK AMAN — liq=%.6f terlalu dekat sl=%.6f "
-        "(buffer=%.1f%%, butuh %.1f%%). Mencari leverage aman...",
+        "(buffer=%.1f%%, butuh %.1f%%). Mode cross: leverage tidak mengubah proyeksi "
+        "liquidation untuk position_size tetap — tidak ada leverage lain yang akan aman.",
         pair, int(initial_leverage),
         proj_initial.liquidation_price, sl_price,
         proj_initial.sl_to_liq_distance_pct * 100,
         safety_buffer_pct * 100,
     )
 
-    try:
-        leverage_safe, proj_safe, even_min_unsafe = _find_safe_leverage(
-            direction=direction,
-            entry_price=entry_price,
-            position_size=position_size,
-            max_leverage=initial_leverage,   # cari dari initial ke bawah
-            maintenance_margin_rate=mm_rate,
-            total_equity=total_equity,
-            total_existing_mm=total_existing_mm,
-            sl_price=sl_price,
-            buffer_pct=safety_buffer_pct,
-        )
-    except ValueError as exc:
-        result.failure_reason = "invalid_parameters"
-        result.notes.append(f"Error saat mencari leverage aman: {exc}")
-        logger.error("[leverage_engine] %s", result.notes[-1])
-        return result
+    leverage_safe = initial_leverage
+    proj_safe = proj_initial
+    even_min_unsafe = True
 
     result.success = True
     result.leverage_safe = leverage_safe
-    result.leverage_adjusted = leverage_safe < initial_leverage
+    result.leverage_adjusted = False
     result.projection = proj_safe
     result.even_min_leverage_unsafe = even_min_unsafe
 
     # ── FORCE_MAX_LEVERAGE override ───────────────────────────────────
-    # Keputusan user: leverage SELALU dipakai di initial_leverage (max
-    # leverage_available atau cap manual /setleverage) — TIDAK PERNAH
-    # diturunkan otomatis, apapun hasil proyeksi liquidation-vs-SL.
-    # max_loss tetap dijamin 1% oleh risk_engine (position_size dari
-    # risk_amount/sl_distance, independen dari leverage) — trade-off yang
-    # disadari: kalau harga gap/slip melewati SL tanpa sempat fill,
-    # liquidation bisa lebih dulu terjadi dengan kerugian > 1%.
-    # proj_initial (dihitung di leverage awal, SEBELUM _find_safe_leverage
-    # mencoba menurunkannya) dipakai sebagai proyeksi yang ditampilkan,
-    # karena itulah leverage yang SEBENARNYA dipakai saat override aktif.
+    # Leverage SELALU dipakai di initial_leverage (max leverage_available
+    # atau cap manual /setleverage) — ini sekarang juga perilaku default
+    # untuk kasus "tidak aman", karena menurunkan leverage tidak memberi
+    # keamanan tambahan di mode cross (lihat komentar di atas). max_loss
+    # tetap dijamin 1% oleh risk_engine (position_size dari risk_amount/
+    # sl_distance, independen dari leverage) — trade-off yang disadari:
+    # kalau harga gap/slip melewati SL tanpa sempat fill, liquidation bisa
+    # lebih dulu terjadi dengan kerugian > 1%.
     if settings.FORCE_MAX_LEVERAGE:
         result.leverage_safe = initial_leverage
         result.leverage_adjusted = False
@@ -783,25 +781,13 @@ async def run_leverage_safety_check(
         except Exception as exc:
             logger.warning("[leverage_engine] Gagal log event: %s", exc)
 
-    elif result.leverage_adjusted:
-        msg = (
-            f"Leverage diturunkan dari {int(initial_leverage)}x → {int(leverage_safe)}x "
-            f"untuk {pair} agar proyeksi liquidation ({proj_safe.liquidation_price:.6f}) "
-            f"tetap aman dari SL ({sl_price:.6f}) dengan buffer {safety_buffer_pct*100:.0f}%. "
-            f"risk_amount & position_size TIDAK berubah — hanya margin_needed yang berubah."
-        )
-        result.notes.append(msg)
-        logger.info("[leverage_engine] %s", msg)
-
-        try:
-            await async_log_event(
-                event_type=EventType.LEVERAGE_ADJUSTED,
-                message=msg,
-                severity=Severity.INFO,
-                component="leverage_engine",
-            )
-        except Exception as exc:
-            logger.warning("[leverage_engine] Gagal log event: %s", exc)
+    # Catatan: cabang "leverage_adjusted" (leverage diturunkan ke nilai
+    # tengah demi keamanan) sengaja DIHAPUS — di mode cross, menurunkan
+    # leverage tidak pernah benar-benar mengurangi risiko liquidation untuk
+    # position_size yang tetap (lihat komentar di langkah 5 di atas), jadi
+    # hasil selalu jatuh ke salah satu dari dua cabang even_min_unsafe di
+    # atas: aman di initial_leverage (return awal proj_initial.is_safe), atau
+    # tidak aman di leverage manapun.
 
     logger.info(
         "[leverage_engine] %s | leverage_safe=%dx | liq=%.6f | sl=%.6f | "
